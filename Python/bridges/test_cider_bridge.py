@@ -2,6 +2,7 @@ import asyncio
 import pytest
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
+import aiohttp
 from aiohttp import ClientConnectionError
 
 
@@ -151,3 +152,100 @@ class TestStateFunctions:
     def test_track_changed_from_none(self):
         from cider_bridge import track_changed
         assert track_changed(None, {"title": "Song", "artist": "Art"}) is True
+
+
+class TestCommandDispatch:
+    @pytest.fixture
+    def mock_cider(self):
+        from cider_bridge import CiderClient
+        client = CiderClient()
+        client.play = AsyncMock(return_value=None)
+        client.pause = AsyncMock(return_value=None)
+        client.playpause = AsyncMock(return_value=None)
+        client.stop = AsyncMock(return_value=None)
+        client.next_track = AsyncMock(return_value=None)
+        client.previous_track = AsyncMock(return_value=None)
+        client.seek = AsyncMock(return_value=None)
+        client.get_volume = AsyncMock(return_value={"volume": 0.5})
+        client.set_volume = AsyncMock(return_value=None)
+        client.toggle_shuffle = AsyncMock(return_value=None)
+        client.toggle_repeat = AsyncMock(return_value=None)
+        client.play_url = AsyncMock(return_value=None)
+        client.play_next = AsyncMock(return_value=None)
+        client.play_later = AsyncMock(return_value=None)
+        client.clear_queue = AsyncMock(return_value=None)
+        client.remove_from_queue = AsyncMock(return_value=None)
+        client.get_queue = AsyncMock(return_value=[])
+        client.now_playing = AsyncMock(return_value=SAMPLE_NOW_PLAYING)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_play_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "play"})
+        mock_cider.play.assert_called_once()
+        assert result["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_seek_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "seek", "position": 60.0})
+        mock_cider.seek.assert_called_once_with(60.0)
+        assert result["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_volume_set_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "volume_set", "volume": 0.8})
+        mock_cider.set_volume.assert_called_once_with(0.8)
+        assert result["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_volume_get_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "volume_get"})
+        assert result["status"] == "ok"
+        assert result["data"] == {"volume": 0.5}
+
+    @pytest.mark.asyncio
+    async def test_play_url_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "play_url", "url": "https://music.apple.com/..."})
+        mock_cider.play_url.assert_called_once_with("https://music.apple.com/...")
+        assert result["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_play_next_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "play_next", "type": "songs", "id": "12345"})
+        mock_cider.play_next.assert_called_once_with("songs", "12345")
+        assert result["status"] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_unknown_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "nonexistent"})
+        assert result["status"] == "error"
+        assert "unknown_command" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_cider_unreachable(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        mock_cider.play = AsyncMock(side_effect=aiohttp.ClientConnectionError("refused"))
+        result = await handle_cider_command(mock_cider, {"command": "play"})
+        assert result["status"] == "error"
+        assert "cider_unreachable" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_get_queue_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "get_queue"})
+        assert result["status"] == "ok"
+        assert result["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_queue_remove_command(self, mock_cider):
+        from cider_bridge import handle_cider_command
+        result = await handle_cider_command(mock_cider, {"command": "queue_remove", "index": 3})
+        mock_cider.remove_from_queue.assert_called_once_with(3)
+        assert result["status"] == "ok"

@@ -171,3 +171,57 @@ def track_changed(old: Optional[dict], new: dict) -> bool:
     if old is None:
         return True
     return old.get("title") != new.get("title") or old.get("artist") != new.get("artist")
+
+
+async def handle_cider_command(cider: CiderClient, payload: dict) -> dict:
+    command = (payload or {}).get("command", "")
+
+    try:
+        if command == "play":
+            await cider.play()
+        elif command == "pause":
+            await cider.pause()
+        elif command == "playpause":
+            await cider.playpause()
+        elif command == "stop":
+            await cider.stop()
+        elif command == "next":
+            await cider.next_track()
+        elif command == "previous":
+            await cider.previous_track()
+        elif command == "seek":
+            await cider.seek(payload["position"])
+        elif command == "volume_get":
+            data = await cider.get_volume()
+            return {"status": "ok", "data": data}
+        elif command == "volume_set":
+            await cider.set_volume(payload["volume"])
+        elif command == "toggle_shuffle":
+            await cider.toggle_shuffle()
+        elif command == "toggle_repeat":
+            await cider.toggle_repeat()
+        elif command == "play_url":
+            await cider.play_url(payload["url"])
+        elif command == "play_next":
+            await cider.play_next(payload["type"], payload["id"])
+        elif command == "play_later":
+            await cider.play_later(payload["type"], payload["id"])
+        elif command == "queue_clear":
+            await cider.clear_queue()
+        elif command == "queue_remove":
+            await cider.remove_from_queue(payload["index"])
+        elif command == "get_queue":
+            data = await cider.get_queue()
+            return {"status": "ok", "data": data}
+        elif command == "get_now_playing":
+            data = await cider.now_playing()
+            return {"status": "ok", "data": data}
+        else:
+            return {"status": "error", "error": "unknown_command"}
+
+        return {"status": "ok"}
+
+    except (aiohttp.ClientConnectionError, aiohttp.ClientError):
+        return {"status": "error", "error": "cider_unreachable"}
+    except KeyError as e:
+        return {"status": "error", "error": f"missing_field:{e}"}
