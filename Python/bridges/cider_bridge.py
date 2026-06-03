@@ -225,3 +225,91 @@ async def handle_cider_command(cider: CiderClient, payload: dict) -> dict:
         return {"status": "error", "error": "cider_unreachable"}
     except KeyError as e:
         return {"status": "error", "error": f"missing_field:{e}"}
+
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from socketCore import MeshSocket
+
+
+class CiderBridge:
+    def __init__(self):
+        self.poll_interval = float(os.getenv("CIDER_POLL_INTERVAL", "1.5"))
+        self.cider = CiderClient()
+
+        mesh_url = os.getenv("MESH_SERVER_URL", "ws://localhost:8765")
+        mesh_token = os.getenv("MESH_AUTH_TOKEN", "")
+
+        self.mesh = MeshSocket(
+            url=mesh_url,
+            name="cider-bridge",
+            auth_token=mesh_token,
+            channel="music",
+            role="node",
+            can_broadcast=True,
+            can_route=True,
+            broadcast_scope="global",
+        )
+
+        self.last_state: Optional[dict] = None
+
+    async def start(self):
+        self.mesh.on("cider_command", self._on_command)
+        await self.mesh.start()
+        await self.mesh.wait_until_ready()
+        log.info("Connected to MeshSocket")
+
+        try:
+            await self._poll_loop()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await self.cider.close()
+            await self.mesh.stop()
+
+    async def _on_command(self, payload):
+        return await handle_cider_command(self.cider, payload)
+
+    async def _poll_loop(self):
+        while True:
+            try:
+                now_playing = await self.cider.now_playing()
+                volume = await self.cider.get_volume()
+                shuffle = await self.cider.get_shuffle()
+                repeat = await self.cider.get_repeat()
+
+                queue = None
+                new_state_preview = extract_state(now_playing, volume, shuffle, repeat, None)
+                if track_changed(self.last_state, new_state_preview):
+                    try:
+                        queue = await self.cider.get_queue()
+                    except Exception:
+                        queue = None
+
+                new_state = extract_state(now_playing, volume, shuffle, repeat, queue)
+                if queue is None and self.last_state:
+                    new_state["queue"] = self.last_state.get("queue", [])
+
+            except (aiohttp.ClientConnectionError, aiohttp.ClientError, Exception):
+                new_state = {"available": False}
+
+            if state_changed(self.last_state, new_state):
+                try:
+                    broadcast_payload = {"msg_type": "cider_state", **new_state}
+                    await self.mesh.send("broadcast_request", broadcast_payload)
+                    self.last_state = new_state
+                except Exception as e:
+                    log.warning(f"Failed to broadcast: {e}")
+
+            await asyncio.sleep(self.poll_interval)
+
+
+async def main():
+    bridge = CiderBridge()
+    await bridge.start()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Cider bridge stopped.")
