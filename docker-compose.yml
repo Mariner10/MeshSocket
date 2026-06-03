@@ -1,0 +1,27 @@
+services:
+  mesh-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    ports:
+      - "8765:8765"
+    environment:
+      - MESH_AUTH_TOKEN=test-token
+      - PYTHONPATH=/app
+    volumes:
+      - ./Python:/app/lib:ro
+
+  echo-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    command: ["python", "-u", "echo_client.py"]
+    environment:
+      - MESH_AUTH_TOKEN=test-token
+      - MESH_SERVER_URL=ws://mesh-server:8765
+      - PYTHONPATH=/app
+    volumes:
+      - ./Python:/app/lib:ro
+      - ./test_helpers/echo_client.py:/app/echo_client.py:ro
+    depends_on:
+      - mesh-server

@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Swift
+Swift/.build/
+Swift/.swiftpm/
+
+# Offline buffer files
+*.jsonl
+
+# Environment
+.env
