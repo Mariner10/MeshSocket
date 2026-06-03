@@ -110,3 +110,64 @@ class CiderClient:
 
     async def remove_from_queue(self, index: int):
         return await self._post("/api/v1/playback/queue/remove-by-index", {"index": index})
+
+
+ARTWORK_SIZE = 600
+
+
+def extract_state(now_playing, volume, shuffle, repeat, queue) -> dict:
+    if now_playing is None:
+        return {"available": False}
+
+    info = now_playing.get("info") or {}
+    artwork_raw = (info.get("artwork") or {}).get("url", "")
+    artwork_url = artwork_raw.replace("{w}", str(ARTWORK_SIZE)).replace("{h}", str(ARTWORK_SIZE))
+
+    queue_items = []
+    if queue:
+        for item in queue:
+            attrs = item if isinstance(item, dict) else {}
+            item_info = attrs.get("attributes") or attrs
+            item_artwork_raw = (item_info.get("artwork") or {}).get("url", "")
+            item_artwork = item_artwork_raw.replace("{w}", str(ARTWORK_SIZE)).replace("{h}", str(ARTWORK_SIZE))
+            queue_items.append({
+                "title": item_info.get("name", ""),
+                "artist": item_info.get("artistName", ""),
+                "artwork_url": item_artwork,
+            })
+
+    return {
+        "available": True,
+        "playing": now_playing.get("isPlaying", False),
+        "title": info.get("name", ""),
+        "artist": info.get("artistName", ""),
+        "album": info.get("albumName", ""),
+        "artwork_url": artwork_url,
+        "duration": (info.get("durationInMillis") or 0) / 1000.0,
+        "elapsed": info.get("currentPlaybackTime", 0.0),
+        "shuffle": (shuffle or {}).get("value", 0),
+        "repeat": (repeat or {}).get("value", 0),
+        "volume": (volume or {}).get("volume", 0.0),
+        "queue": queue_items,
+    }
+
+
+def state_changed(old: dict, new: dict) -> bool:
+    if old is None or new is None:
+        return True
+    if old.get("available") != new.get("available"):
+        return True
+    for key in ("title", "artist", "album", "artwork_url", "playing", "shuffle", "repeat", "duration"):
+        if old.get(key) != new.get(key):
+            return True
+    if abs(old.get("volume", 0) - new.get("volume", 0)) > 0.01:
+        return True
+    if int(old.get("elapsed", 0)) != int(new.get("elapsed", 0)):
+        return True
+    return False
+
+
+def track_changed(old: Optional[dict], new: dict) -> bool:
+    if old is None:
+        return True
+    return old.get("title") != new.get("title") or old.get("artist") != new.get("artist")
