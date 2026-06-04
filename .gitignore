@@ -15,4 +15,4 @@ Swift/.swiftpm/
 
 # Environment
 .env
-./Python/bridges/
+/Python/bridges/

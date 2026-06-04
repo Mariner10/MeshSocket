@@ -9,7 +9,7 @@ public enum MeshSocketError: Error, Sendable {
 public actor MeshSocket {
     public let url: URL
     public let name: String
-    public nonisolated let id: String
+    public private(set) var id: String
 
     private let authToken: String?
     private let channel: String?
@@ -24,6 +24,9 @@ public actor MeshSocket {
     private let offlineFilePath: String?
     private let onReconnect: (@Sendable () async -> Void)?
     private let onDisconnect: (@Sendable () async -> Void)?
+
+    private let rateLimit: Int
+    private var msgTimes: [Date] = []
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var isRunning = false
@@ -44,6 +47,7 @@ public actor MeshSocket {
         url: String,
         name: String = "Node",
         authToken: String? = nil,
+        rateLimit: Int = 0,
         channel: String? = nil,
         role: String? = nil,
         canBroadcast: Bool? = nil,
@@ -72,21 +76,25 @@ public actor MeshSocket {
         self.broadcastScope = broadcastScope ?? ProcessInfo.processInfo.environment["MESH_BROADCAST_SCOPE"]
         self.maxOfflineBuffer = maxOfflineBuffer
         self.offlineFilePath = offlineFilePath
+        self.rateLimit = rateLimit
         self.onReconnect = onReconnect
         self.onDisconnect = onDisconnect
 
-        handlers["handshake"] = { [id] payload in
+        handlers["handshake"] = { [weak self] payload in
             guard let dict = payload as? [String: Any],
                   let t = dict["t"] as? Double ?? (dict["t"] as? String).flatMap(Double.init) else {
                 return nil
             }
-            return ["server_id": id, "l": Date().timeIntervalSince1970 - t] as [String: Any]
+            let currentID = await self?.id ?? ""
+            return ["server_id": currentID, "l": Date().timeIntervalSince1970 - t] as [String: Any]
         }
         handlers["ping"] = { _ in "pong" }
-        handlers["status_request"] = { [name, id] _ in
-            [
-                "name": name,
-                "id": id,
+        handlers["status_request"] = { [weak self] _ in
+            let currentName = await self?.name ?? ""
+            let currentID = await self?.id ?? ""
+            return [
+                "name": currentName,
+                "id": currentID,
                 "status": "online",
                 "memory_usage": "unknown",
             ] as [String: Any]
@@ -255,6 +263,20 @@ public actor MeshSocket {
         while isRunning {
             do {
                 let message = try await ws.receive()
+
+                if rateLimit > 0 {
+                    let now = Date()
+                    msgTimes.append(now)
+                    if msgTimes.count > rateLimit {
+                        msgTimes.removeFirst(msgTimes.count - rateLimit)
+                    }
+                    if msgTimes.count == rateLimit,
+                       now.timeIntervalSince(msgTimes[0]) < 1.0 {
+                        ws.cancel(with: .policyViolation, reason: "Rate limit exceeded".data(using: .utf8))
+                        return
+                    }
+                }
+
                 switch message {
                 case .string(let text):
                     guard let data = text.data(using: .utf8),
@@ -284,6 +306,14 @@ public actor MeshSocket {
 
         if let replyTo, let continuation = pendingRequests.removeValue(forKey: replyTo) {
             continuation.resume(returning: payload)
+            return
+        }
+
+        if msgType == "welcome" {
+            if let dict = payload as? [String: Any],
+               let serverID = dict["id"] as? String {
+                self.id = serverID
+            }
             return
         }
 
@@ -415,7 +445,6 @@ public actor MeshSocket {
     private func buildIdentityPayload() -> [String: Any] {
         var payload: [String: Any] = [
             "name": name,
-            "id": id,
             "token": authToken as Any,
         ]
         if let channel { payload["channel"] = channel }

@@ -1,24 +1,46 @@
 import asyncio
+import uuid
 import websockets
-from lib.socketCore import MeshSocket, LogColors
+from socketCore import MeshSocket, LogColors
 import logging
 import os
-from typing import Any
+from typing import Any, Callable, Dict, Optional
 
-# Pre-auth connection ceiling for client bursts on mobile browsers.
 _MAX_PENDING_PER_IP = 10
-_pending_conns: dict[str, int] = {}
+_pending_conns: Dict[str, int] = {}
+
 
 class MeshServer:
-    def __init__(self, host="localhost", port=8765):
+    def __init__(self,
+                 host: str = "0.0.0.0",
+                 port: int = 8765,
+                 rate_limit: int = 0,
+                 max_size: int = 1_048_576,
+                 auth_handler: Optional[Callable] = None,
+                 on_startup: Optional[Callable] = None,
+                 on_authenticated: Optional[Callable] = None):
         self.host = host
         self.port = port
-        self.clients = set() # Set of MeshSocket objects
+        self.rate_limit = rate_limit
+        self.max_size = max_size
 
-    async def start(self):
-        logging.info(f"{LogColors.HEADER}Starting Server on {self.host}:{self.port}{LogColors.ENDC}")
-        async with websockets.serve(self._handle_connection, self.host, self.port, max_size=262144):
-            await asyncio.Future() # Run forever
+        # auth_handler(token, remote_ip) → bool
+        # Default: compare against MESH_AUTH_TOKEN env var.
+        self._auth_handler = auth_handler or self._default_auth
+        # on_startup() — called once before the server starts accepting connections.
+        self._on_startup = on_startup
+        # on_authenticated(client, remote_ip, token) — called after a client passes auth.
+        self._on_authenticated = on_authenticated
+
+        self.clients: Dict[str, MeshSocket] = {}
+        self.clients_by_name: Dict[str, MeshSocket] = {}
+
+    @staticmethod
+    def _default_auth(token: str, remote_ip: str) -> bool:
+        server_token = os.getenv("MESH_AUTH_TOKEN")
+        if not server_token:
+            return True
+        return token == server_token
 
     def _parse_bool(self, value: Any, default: bool = False) -> bool:
         if isinstance(value, bool):
@@ -35,7 +57,7 @@ class MeshServer:
             return True
         return self._same_channel(source, target)
 
-    def _client_summary(self, client: MeshSocket) -> dict[str, Any]:
+    def _client_summary(self, client: MeshSocket) -> Dict[str, str]:
         return {
             "id": client.id,
             "name": client.name,
@@ -63,9 +85,21 @@ class MeshServer:
             return websocket.remote_address[0]
         return "unknown"
 
+    async def start(self):
+        if self._on_startup:
+            self._on_startup()
+        logging.info(f"{LogColors.HEADER}Starting Server on ws://{self.host}:{self.port}{LogColors.ENDC}")
+        async with websockets.serve(
+            self._handle_connection,
+            self.host,
+            self.port,
+            max_size=self.max_size,
+        ):
+            await asyncio.Future()
+
     async def _handle_connection(self, websocket):
         remote_ip = self._client_ip(websocket)
-        logging.info(f"{LogColors.BLUE}New connection from {remote_ip}{LogColors.ENDC}")
+        logging.info(f"New connection from {remote_ip}")
 
         pending = _pending_conns.get(remote_ip, 0)
         if pending >= _MAX_PENDING_PER_IP:
@@ -78,9 +112,11 @@ class MeshServer:
 
         _pending_conns[remote_ip] = pending + 1
         try:
-
-            # 1. Wrap the raw websocket in our protocol
-            client = MeshSocket(connection=websocket, name=f"Client-{id(websocket)}")
+            client = MeshSocket(
+                connection=websocket,
+                name=f"Client-{id(websocket)}",
+                rate_limit=self.rate_limit,
+            )
             client.channel = "default"
             client.role = "unknown"
             client.can_broadcast = False
@@ -88,41 +124,55 @@ class MeshServer:
             client.can_cross_channel_route = False
             client.can_monitor = False
             client.broadcast_scope = "channel"
-        
-            # 2. Authentication Flow
-            authenticated = asyncio.Future()
-            server_token = os.getenv('MESH_AUTH_TOKEN')
+
             allowed_origins = {
                 origin.strip()
                 for origin in os.getenv(
                     "MESH_ALLOWED_ORIGINS",
                     "http://127.0.0.1,http://localhost"
-                )
-                .split(",")
+                ).split(",")
                 if origin.strip()
             }
-
             request_headers = getattr(websocket, "request_headers", None)
             if request_headers is None and getattr(websocket, "request", None) is not None:
                 request_headers = websocket.request.headers
             origin = request_headers.get("Origin") if request_headers else None
             if origin and not any(origin == allowed or origin.startswith(allowed) for allowed in allowed_origins):
-                logging.warning(f"{LogColors.FAIL}Origin Rejected: {origin}{LogColors.ENDC}")
-                await websocket.close(code=1008, reason="origin not allowed")
+                logging.warning(f"{LogColors.FAIL}Origin rejected: {origin}{LogColors.ENDC}")
+                await websocket.close(1008, "origin not allowed")
                 return
+
+            authenticated: asyncio.Future = asyncio.get_running_loop().create_future()
 
             @client.on('identify')
             async def handle_identify(payload):
                 payload = payload or {}
-                client_token = payload.get('token')
-                if server_token and client_token != server_token:
-                    logging.warning(f"{LogColors.FAIL}Auth Failed for {client.name}{LogColors.ENDC}")
+                requested_name = payload.get('name', client.name)
+                client_token = payload.get('token', '')
+
+                if not self._auth_handler(client_token, remote_ip):
+                    logging.warning(
+                        f"{LogColors.FAIL}Auth failed (bad/missing token) for {remote_ip}{LogColors.ENDC}"
+                    )
                     if not authenticated.done():
                         authenticated.set_result(False)
                     return
 
-                client.name = payload.get('name', client.name)
-                client.id = payload.get('id', client.id)
+                if requested_name in self.clients_by_name:
+                    logging.warning(
+                        f"{LogColors.FAIL}Auth failed (duplicate name '{requested_name}') "
+                        f"for {remote_ip}{LogColors.ENDC}"
+                    )
+                    if not authenticated.done():
+                        authenticated.set_result(False)
+                    return
+
+                new_id = str(uuid.uuid4())
+                while new_id in self.clients:
+                    new_id = str(uuid.uuid4())
+
+                client.id = new_id
+                client.name = requested_name
                 client.channel = payload.get('channel') or "default"
                 client.role = payload.get('role') or "node"
                 client.can_broadcast = self._parse_bool(payload.get('can_broadcast'), client.role in {"dashboard", "browser", "mobile", "node"})
@@ -131,39 +181,52 @@ class MeshServer:
                 client.can_monitor = self._parse_bool(payload.get('can_monitor'), client.role in {"dashboard", "browser"})
                 client.broadcast_scope = payload.get('broadcast_scope') or ("global" if client.can_monitor else "channel")
 
-                logging.info(f"{LogColors.GREEN}Client identified as: {client.name}{LogColors.ENDC}")
+                logging.info(
+                    f"{LogColors.GREEN}Identified: '{client.name}' → {client.id}{LogColors.ENDC}"
+                )
+
+                if self._on_authenticated:
+                    self._on_authenticated(client, remote_ip, client_token)
+
                 if not authenticated.done():
                     authenticated.set_result(True)
 
+                await client.send("welcome", {"id": client.id, "name": client.name})
                 await self._broadcast_client_list()
 
-            # We need to start processing packets to receive the 'identify' message
             listen_task = asyncio.create_task(client.listen())
 
             try:
-                # Wait for authentication with a timeout
                 is_auth = await asyncio.wait_for(authenticated, timeout=5.0)
-                if not is_auth:
-                    await client.stop()
-                    return
             except asyncio.TimeoutError:
-                logging.warning(f"{LogColors.FAIL}Auth Timeout for {client.name}{LogColors.ENDC}")
+                logging.warning(
+                    f"{LogColors.FAIL}Auth timeout for {remote_ip} — closing silently{LogColors.ENDC}"
+                )
+                listen_task.cancel()
                 await client.stop()
                 return
             except Exception as e:
-                logging.error(f"Auth error: {e}")
+                logging.error(f"Auth error for {remote_ip}: {e}")
+                listen_task.cancel()
                 await client.stop()
                 return
 
-            self.clients.add(client)
-            logging.info(f"{LogColors.GREEN}New Authenticated Connection. Total Clients: {len(self.clients)}{LogColors.ENDC}")
+            if not is_auth:
+                listen_task.cancel()
+                await client.stop()
+                return
 
-            # 3. Register Server-Side Handlers for this specific client
+            self.clients[client.id] = client
+            self.clients_by_name[client.name] = client
+            logging.info(
+                f"{LogColors.GREEN}'{client.name}' connected. "
+                f"Total clients: {len(self.clients)}{LogColors.ENDC}"
+            )
+
             @client.on("broadcast_request")
             async def on_broadcast(payload):
                 if not client.can_broadcast:
                     return {"error": "broadcast not allowed", "status": "failed"}
-                logging.info(f"Broadcast Request: {payload}")
                 await self.broadcast("broadcast", payload, sender=client)
                 return {"status": "sent"}
 
@@ -171,15 +234,13 @@ class MeshServer:
             async def on_iCloud_broadcast(payload):
                 if not client.can_broadcast:
                     return {"error": "broadcast not allowed", "status": "failed"}
-                logging.info(f"iCloud Data: {payload}")
                 await self.broadcast("iCloudListen", payload, sender=client)
                 return {"status": "sent"}
-        
+
             @client.on("request_prediction")
             async def on_prediction_request(payload):
                 if not client.can_broadcast:
                     return {"error": "broadcast not allowed", "status": "failed"}
-                logging.info(f"Prediction Request: {payload}")
                 await self.broadcast("request_prediction", payload, sender=client)
                 return {"status": "forwarded"}
 
@@ -187,7 +248,6 @@ class MeshServer:
             async def on_prediction_result(payload):
                 if not client.can_broadcast:
                     return {"error": "broadcast not allowed", "status": "failed"}
-                logging.info(f"Prediction Result: {payload}")
                 await self.broadcast("prediction_result", payload, sender=client)
                 return {"status": "forwarded"}
 
@@ -205,40 +265,39 @@ class MeshServer:
 
             @client.on('route_msg')
             async def on_route(payload):
-                """
-                Allows a client to send a 'UDP' message to another specific client ( by ID )
-                and get the response back.
-                """
-                if not client.can_route:
-                    return {"error": "routing not allowed", "status": "failed"}
-
                 target_id = payload.get('target_id')
                 msg_type = payload.get('type')
                 data = payload.get('payload')
 
-                target = next((c for c in self.clients if c.id == target_id), None)
-
+                target = self.clients.get(target_id)
                 if target:
+                    if not client.can_route:
+                        return {"error": "routing not allowed", "status": "failed"}
                     if not client.can_cross_channel_route and not self._same_channel(client, target):
                         return {"error": "cross-channel route denied", "status": "failed"}
                     response = await target.request(msg_type, data, timeout=5.0)
                     return response
-                else:
-                    return {"error": "Target not found", "status": "failed"}
+                return {"error": "Target not found", "status": "failed"}
+
+            @client.on("get_nodes")
+            async def on_get_nodes(payload):
+                client_list = [
+                    self._client_summary(c)
+                    for c in self.clients.values()
+                    if c.id != client.id and (client.can_monitor and (client.broadcast_scope == "global" or self._same_channel(client, c)))
+                ]
+                return {"clients": client_list}
 
             @client.on('route_msg_noreply')
             async def on_noreply_route(payload):
-                """Allows a client to send a 'TCP' message to another specific client ( by name )"""
-                if not client.can_route:
-                    return {"error": "routing not allowed", "status": "failed"}
-
                 target_name = payload.get('target_name')
                 msg_type = payload.get('type')
                 data = payload.get('payload')
 
-                target = next((c for c in self.clients if c.name == target_name), None)
-
+                target = self.clients_by_name.get(target_name)
                 if target:
+                    if not client.can_route:
+                        return {"error": "routing not allowed", "status": "failed"}
                     if not client.can_cross_channel_route and not self._same_channel(client, target):
                         return {"error": "cross-channel route denied", "status": "failed"}
                     await target.send(msg_type, data)
@@ -246,49 +305,42 @@ class MeshServer:
                     return {"error": "Target not found", "status": "failed"}
 
             try:
-                # Wait for the listen task to complete (when connection closes)
                 await listen_task
             finally:
-                # 4. Cleanup on disconnect
-                if client in self.clients:
-                    self.clients.remove(client)
-                logging.info(f"{LogColors.WARNING}Client Disconnected. Remaining: {len(self.clients)}{LogColors.ENDC}")
+                self.clients.pop(client.id, None)
+                self.clients_by_name.pop(client.name, None)
+                logging.info(
+                    f"{LogColors.WARNING}'{client.name}' disconnected. "
+                    f"Remaining: {len(self.clients)}{LogColors.ENDC}"
+                )
+                await self._broadcast_client_list()
         finally:
             _pending_conns[remote_ip] = max(0, _pending_conns.get(remote_ip, 1) - 1)
 
-            
     async def _broadcast_client_list(self):
-        """Sends the current list of connected clients to everyone."""
-        for client in self.clients:
+        for client in self.clients.values():
             if not getattr(client, "can_monitor", False):
                 continue
-
             if getattr(client, "broadcast_scope", "channel") == "global":
-                visible_clients = [self._client_summary(peer) for peer in self.clients]
+                visible_clients = [self._client_summary(peer) for peer in self.clients.values()]
             else:
-                visible_clients = [
-                    self._client_summary(peer)
-                    for peer in self.clients
-                    if self._same_channel(client, peer)
-                ]
-
+                visible_clients = [self._client_summary(peer) for peer in self.clients.values() if self._same_channel(client, peer)]
             await client.send('server_client_list', {'clients': visible_clients})
 
     async def broadcast(self, type: str, payload: dict, sender: MeshSocket | None = None):
-        """Sends a message to all connected clients."""
         if not self.clients:
             return
-
         tasks = []
-        for peer in self.clients:
+        for peer in self.clients.values():
             if sender and not self._can_receive_broadcast(sender, peer):
                 continue
             tasks.append(peer.send(type, payload))
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 
 if __name__ == "__main__":
-    server = MeshServer(host='0.0.0.0')
+    server = MeshServer()
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:
-        print("Server Stopped.")
+        print("Server stopped.")
