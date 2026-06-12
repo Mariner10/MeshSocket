@@ -244,7 +244,10 @@ class MeshSocket:
 
                     await self._listen_loop()
 
-            except (OSError, websockets.exceptions.ConnectionClosed) as e:
+            except Exception as e:
+                # Catch everything (not just OSError/ConnectionClosed): a server
+                # restart behind Cloudflare surfaces as InvalidStatus (HTTP 521),
+                # which previously escaped and killed this task for good.
                 logging.warning(f"{LogColors.WARNING}{self.name} disconnected: {e}{LogColors.ENDC}")
 
                 if self.on_disconnect_callback:
