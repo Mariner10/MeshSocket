@@ -194,35 +194,10 @@ class MeshServer:
                 await client.send("welcome", {"id": client.id, "name": client.name})
                 await self._broadcast_client_list()
 
-            listen_task = asyncio.create_task(client.listen())
-
-            try:
-                is_auth = await asyncio.wait_for(authenticated, timeout=5.0)
-            except asyncio.TimeoutError:
-                logging.warning(
-                    f"{LogColors.FAIL}Auth timeout for {remote_ip} — closing silently{LogColors.ENDC}"
-                )
-                listen_task.cancel()
-                await client.stop()
-                return
-            except Exception as e:
-                logging.error(f"Auth error for {remote_ip}: {e}")
-                listen_task.cancel()
-                await client.stop()
-                return
-
-            if not is_auth:
-                listen_task.cancel()
-                await client.stop()
-                return
-
-            self.clients[client.id] = client
-            self.clients_by_name[client.name] = client
-            logging.info(
-                f"{LogColors.GREEN}'{client.name}' connected. "
-                f"Total clients: {len(self.clients)}{LogColors.ENDC}"
-            )
-
+            # Register handlers BEFORE the listen loop starts so the first
+            # request after the identify ack can't race past registration and
+            # get dropped. Permission flags stay False until identify, so
+            # nothing here is reachable pre-auth.
             @client.on("broadcast_request")
             async def on_broadcast(payload):
                 if not client.can_broadcast:
@@ -310,6 +285,36 @@ class MeshServer:
                     await target.send(msg_type, data)
                 else:
                     return {"error": "Target not found", "status": "failed"}
+
+            listen_task = asyncio.create_task(client.listen())
+
+            try:
+                is_auth = await asyncio.wait_for(authenticated, timeout=5.0)
+            except asyncio.TimeoutError:
+                logging.warning(
+                    f"{LogColors.FAIL}Auth timeout for {remote_ip} — closing silently{LogColors.ENDC}"
+                )
+                listen_task.cancel()
+                await client.stop()
+                return
+            except Exception as e:
+                logging.error(f"Auth error for {remote_ip}: {e}")
+                listen_task.cancel()
+                await client.stop()
+                return
+
+            if not is_auth:
+                listen_task.cancel()
+                await client.stop()
+                return
+
+            self.clients[client.id] = client
+            self.clients_by_name[client.name] = client
+            logging.info(
+                f"{LogColors.GREEN}'{client.name}' connected. "
+                f"Total clients: {len(self.clients)}{LogColors.ENDC}"
+            )
+
 
             try:
                 await listen_task
