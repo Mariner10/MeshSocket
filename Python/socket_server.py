@@ -237,6 +237,13 @@ class MeshServer:
                 await self.broadcast("iCloudListen", payload, sender=client)
                 return {"status": "sent"}
 
+            @client.on("place_visit_Broadcast")
+            async def on_place_visit_broadcast(payload):
+                if not client.can_broadcast:
+                    return {"error": "broadcast not allowed", "status": "failed"}
+                await self.broadcast("placeVisitListen", payload, sender=client)
+                return {"status": "sent"}
+
             @client.on("request_prediction")
             async def on_prediction_request(payload):
                 if not client.can_broadcast:
