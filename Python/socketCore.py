@@ -146,6 +146,9 @@ class MeshSocket:
         self.handlers[type] = func
         return func
 
+    def off(self, type: str):
+        self.handlers.pop(type, None)
+
     def setup_logging(self, level=logging.INFO):
         """Attaches a SocketLoggingHandler to the root logger."""
         handler = SocketLoggingHandler(self)
