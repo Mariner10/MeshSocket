@@ -32,7 +32,7 @@ public actor MeshSocket {
     private var isRunning = false
     private var startTime: Date?
 
-    private var handlers: [String: @Sendable (Any?) async -> Any?] = [:]
+    var handlers: [String: @Sendable (Any?) async -> Any?] = [:]
     private var pendingRequests: [String: CheckedContinuation<Any?, Error>] = [:]
 
     private var ramBuffer: [String] = []
@@ -132,6 +132,10 @@ public actor MeshSocket {
 
     public func on(_ type: String, handler: @escaping @Sendable (Any?) async -> Any?) {
         handlers[type] = handler
+    }
+
+    public func off(_ type: String) {
+        handlers[type] = nil
     }
 
     @discardableResult
