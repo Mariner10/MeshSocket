@@ -116,6 +116,12 @@ class MeshSocket:
         self._connected_event: Optional[asyncio.Event] = None
         self._server_mode_connected: bool = connection is not None
 
+        # Admission gate (client mode): set when the server's `welcome` confirms
+        # our identify was accepted, so readiness/on_reconnect don't fire for a
+        # rejected identify (e.g. a duplicate name) that the server silently closes.
+        # Stays None in server mode.
+        self._admitted_event: Optional[asyncio.Event] = None
+
         # Handlers
         self.handlers: Dict[str, Callable] = {}
         self._pending_requests: Dict[str, asyncio.Future] = {}
@@ -223,16 +229,42 @@ class MeshSocket:
     async def _maintain_connection(self):
         retry_delay = 2
         while self.is_running:
+            listen_task = None
+            admitted = False
             try:
                 logging.info(f"{LogColors.BLUE}{self.name} connecting to {self.url}...{LogColors.ENDC}")
                 ssl_context = ssl.create_default_context(cafile=certifi.where()) if self.url.startswith("wss://") else None
                 async with websockets.connect(self.url, ssl=ssl_context) as ws:
                     self.connection = ws
-                    self.connected_event.set()
-                    logging.info(f"{LogColors.GREEN}{self.name} Connected!{LogColors.ENDC}")
                     retry_delay = 2
 
-                    await self.send("identify", self._build_identity_payload())
+                    # Arm the admission gate before identify so a welcome delivered
+                    # by the concurrently-running listen loop can't be missed.
+                    self._admitted_event = asyncio.Event()
+
+                    # Send identify directly on the socket: connected_event is not
+                    # set yet, so the normal send() path would buffer or raise.
+                    identify_packet = json.dumps({
+                        "id": str(uuid.uuid4()), "type": "identify",
+                        "payload": self._build_identity_payload(), "reply_to": None,
+                    })
+                    await ws.send(identify_packet)
+
+                    # Pump messages concurrently so the server's welcome — or a close
+                    # that rejects the identify (e.g. a duplicate name) — is observed
+                    # while we wait for admission.
+                    listen_task = asyncio.create_task(self._listen_loop())
+                    admitted = await self._await_admission(listen_task, timeout=10)
+                    if not admitted:
+                        # Never admitted: surface as a failed attempt and retry with
+                        # backoff instead of reporting the connection as up.
+                        listen_task.cancel()
+                        raise ConnectionError(
+                            "identify not admitted (no welcome) — likely a duplicate name or rejected token"
+                        )
+
+                    self.connected_event.set()
+                    logging.info(f"{LogColors.GREEN}{self.name} Connected!{LogColors.ENDC}")
 
                     await self._flush_offline_queue()
 
@@ -245,7 +277,7 @@ class MeshSocket:
                         except Exception as e:
                             logging.error(f"Error in on_reconnect callback: {e}")
 
-                    await self._listen_loop()
+                    await listen_task
 
             except Exception as e:
                 # Catch everything (not just OSError/ConnectionClosed): a server
@@ -253,7 +285,15 @@ class MeshSocket:
                 # which previously escaped and killed this task for good.
                 logging.warning(f"{LogColors.WARNING}{self.name} disconnected: {e}{LogColors.ENDC}")
 
-                if self.on_disconnect_callback:
+            finally:
+                if listen_task and not listen_task.done():
+                    listen_task.cancel()
+                self.connected_event.clear()
+                self.connection = None
+                self._fail_all_pending_requests()
+                # Pair on_disconnect to the admitted up-edge: an unadmitted attempt
+                # never reported connected, so it must not report a disconnect.
+                if admitted and self.on_disconnect_callback:
                     try:
                         if inspect.iscoroutinefunction(self.on_disconnect_callback):
                             await self.on_disconnect_callback()
@@ -262,15 +302,24 @@ class MeshSocket:
                     except Exception as err:
                         logging.error(f"Error in on_disconnect callback: {err}")
 
-            finally:
-                self.connected_event.clear()
-                self.connection = None
-                self._fail_all_pending_requests()
-
             if self.is_running:
                 logging.info(f"{self.name} retrying in {retry_delay}s...")
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30)
+
+    async def _await_admission(self, listen_task: asyncio.Task, timeout: float) -> bool:
+        """Wait until the server's welcome admits this connection, or the socket
+        closes / times out first. Returns True only on a real admission."""
+        admit_wait = asyncio.ensure_future(self._admitted_event.wait())
+        done, _ = await asyncio.wait(
+            {admit_wait, listen_task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if admit_wait in done:
+            return True
+        admit_wait.cancel()
+        return False
 
     # --- SEND LOGIC ---
     async def send(self, type: str, payload: Any = None, reply_to: str = None) -> Optional[str]:
@@ -403,6 +452,9 @@ class MeshSocket:
         if server_id:
             logging.info(f"{self.name} assigned server ID: {server_id}")
             self.id = server_id
+        # Admit the connection (client mode). None in server mode.
+        if self._admitted_event is not None:
+            self._admitted_event.set()
 
     async def _handle_handshake(self, payload):
         t_remote = float(payload.get('t'))
