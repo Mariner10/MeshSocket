@@ -40,6 +40,12 @@ public actor MeshSocket {
     private var readyContinuations: [CheckedContinuation<Void, Never>] = []
     private var _isConnected = false
 
+    // Admission gate: readiness is confirmed by the server's `welcome`, not merely
+    // by the socket opening. `admittedFlag` latches a welcome that arrives before
+    // we start awaiting it (the receive loop runs concurrently), so it can't be lost.
+    private var admitContinuation: CheckedContinuation<Bool, Never>?
+    private var admittedFlag = false
+
     private var connectionTask: Task<Void, Never>?
     private var listenTask: Task<Void, Never>?
 
@@ -213,6 +219,8 @@ public actor MeshSocket {
         var retryDelay: UInt64 = 2
 
         while isRunning {
+            var loop: Task<Void, Never>?
+            var didSignalUp = false
             do {
                 let session = URLSession(configuration: .default)
                 let ws = session.webSocketTask(with: url)
@@ -226,31 +234,68 @@ public actor MeshSocket {
                 }
 
                 webSocketTask = ws
+                resetAdmission()
+
+                // Send identify directly: the socket is open but not yet admitted,
+                // so `_isConnected` is still false and the buffered `send()` path
+                // would not transmit.
+                let identifyPacket = buildPacket(id: UUID().uuidString, type: "identify",
+                                                 payload: buildIdentityPayload(), replyTo: nil)
+                try await ws.send(.string(identifyPacket))
+
+                // Run the receive loop while we wait, so the server's `welcome` — or
+                // a close that rejects the identify (e.g. a name conflict) — is
+                // observed. A close before admission resolves the wait negatively.
+                let started = Task { [weak self] in
+                    await self?.listenLoop(ws: ws)
+                    await self?.failAdmission()
+                }
+                loop = started
+                listenTask = started
+
+                guard await awaitAdmission() else {
+                    // Never admitted (identify rejected / closed / timed out). Surface
+                    // it as a failed attempt and retry with backoff instead of
+                    // silently reporting the connection as up. Wake any waiters so a
+                    // caller blocked in `waitUntilReady()` (e.g. the app's connect
+                    // path) doesn't hang on a doomed connection — `_isConnected`
+                    // stays false, so they observe the truth, and `onReconnect`
+                    // never fires for an unadmitted socket.
+                    started.cancel()
+                    ws.cancel(with: .goingAway, reason: nil)
+                    signalReady()
+                    throw MeshSocketError.notConnected
+                }
+
                 _isConnected = true
                 retryDelay = 2
-
-                try await send("identify", payload: buildIdentityPayload())
                 await flushOfflineQueue()
-
                 signalReady()
+                didSignalUp = true
 
                 if let onReconnect {
                     await onReconnect()
                 }
 
-                await listenLoop(ws: ws)
+                await started.value
 
             } catch is CancellationError {
+                loop?.cancel()
                 break
             } catch {
-                if let onDisconnect {
-                    await onDisconnect()
-                }
+                loop?.cancel()
             }
 
             setDisconnected()
             webSocketTask = nil
             failAllPendingRequests()
+
+            // Pair the down-edge with the up-edge: only report a disconnect for a
+            // connection that was actually admitted, so a rejected attempt no longer
+            // produces a phantom connect/disconnect that the app surfaces as "up".
+            if didSignalUp, let onDisconnect {
+                await onDisconnect()
+            }
 
             guard isRunning else { break }
 
@@ -318,6 +363,7 @@ public actor MeshSocket {
                let serverID = dict["id"] as? String {
                 self.id = serverID
             }
+            noteWelcome()
             return
         }
 
@@ -339,6 +385,52 @@ public actor MeshSocket {
 
     private func setDisconnected() {
         _isConnected = false
+    }
+
+    // MARK: - Admission (welcome) Gate
+
+    /// Arm the gate for a fresh connection attempt. Called before `identify` is
+    /// sent so a `welcome` delivered by the concurrently-running receive loop is
+    /// latched rather than dropped.
+    private func resetAdmission() {
+        admittedFlag = false
+        admitContinuation = nil
+    }
+
+    /// The server admitted us (`welcome` received).
+    private func noteWelcome() {
+        admittedFlag = true
+        if let cont = admitContinuation {
+            admitContinuation = nil
+            cont.resume(returning: true)
+        }
+    }
+
+    /// The socket closed (or the wait timed out) before a `welcome` arrived — the
+    /// server never admitted this connection (e.g. identify rejected). Unblocks the
+    /// admission wait with a negative result; no-op once admission is decided.
+    private func failAdmission() {
+        if let cont = admitContinuation {
+            admitContinuation = nil
+            cont.resume(returning: false)
+        }
+    }
+
+    /// Suspend until the server admits this connection (`welcome`) or it is closed
+    /// / times out first. Returns true only on a real admission.
+    private func awaitAdmission(timeout: TimeInterval = 5.0) async -> Bool {
+        if admittedFlag { return true }
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            if admittedFlag {
+                cont.resume(returning: true)
+                return
+            }
+            admitContinuation = cont
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                await self?.failAdmission()
+            }
+        }
     }
 
     // MARK: - Pending Requests
