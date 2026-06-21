@@ -158,14 +158,22 @@ class MeshServer:
                         authenticated.set_result(False)
                     return
 
-                if requested_name in self.clients_by_name:
+                incumbent = self.clients_by_name.get(requested_name)
+                if incumbent is not None and incumbent is not client:
+                    # Last-writer-wins: a reconnecting peer reclaims its name. The
+                    # old socket is usually a half-open ghost the server hasn't
+                    # reaped yet; rejecting the newcomer instead would leave it
+                    # silently retrying forever. Drop the incumbent from the roster
+                    # now (so the newcomer can register cleanly below) and close it
+                    # out of band. The identity-checked cleanup in the connection
+                    # finally keeps the ghost's teardown from clobbering this entry.
                     logging.warning(
-                        f"{LogColors.FAIL}Auth failed (duplicate name '{requested_name}') "
-                        f"for {remote_ip}{LogColors.ENDC}"
+                        f"{LogColors.WARNING}Name '{requested_name}' reclaimed by {remote_ip} — "
+                        f"evicting stale client {incumbent.id}{LogColors.ENDC}"
                     )
-                    if not authenticated.done():
-                        authenticated.set_result(False)
-                    return
+                    self.clients.pop(incumbent.id, None)
+                    self.clients_by_name.pop(requested_name, None)
+                    asyncio.create_task(incumbent.stop())
 
                 new_id = str(uuid.uuid4())
                 while new_id in self.clients:
@@ -320,7 +328,11 @@ class MeshServer:
                 await listen_task
             finally:
                 self.clients.pop(client.id, None)
-                self.clients_by_name.pop(client.name, None)
+                # Only release the name if it still points at *this* client — an
+                # evicted incumbent must not pop the entry of the peer that just
+                # reclaimed its name (see the eviction path in handle_identify).
+                if self.clients_by_name.get(client.name) is client:
+                    self.clients_by_name.pop(client.name, None)
                 logging.info(
                     f"{LogColors.WARNING}'{client.name}' disconnected. "
                     f"Remaining: {len(self.clients)}{LogColors.ENDC}"
