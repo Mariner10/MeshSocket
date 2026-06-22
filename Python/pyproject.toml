@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshsocket"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lightweight WebSocket mesh networking — broadcast, direct routing, and request/response over a simple JSON wire protocol."
 readme = "README.md"
 requires-python = ">=3.10"
