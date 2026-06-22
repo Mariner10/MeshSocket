@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshsocket"
+version = "0.1.0"
+description = "Lightweight WebSocket mesh networking — broadcast, direct routing, and request/response over a simple JSON wire protocol."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Carter Beaudoin" }]
+keywords = ["websocket", "mesh", "networking", "rpc", "pubsub", "asyncio"]
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "websockets>=12",
+    "certifi",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Intended Audience :: Developers",
+    "Topic :: System :: Networking",
+    "Framework :: AsyncIO",
+    "Development Status :: 4 - Beta",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mariner10/MeshSocket"
+Repository = "https://github.com/Mariner10/MeshSocket"
+
+# Explicit layout (disables flat-layout auto-discovery, which would trip over the
+# test files and the empty package __init__ in this directory).
+[tool.setuptools]
+py-modules = ["socketCore", "socket_server"]
+packages = ["meshsocket"]

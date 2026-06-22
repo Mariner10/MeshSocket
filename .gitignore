@@ -16,3 +16,10 @@ Swift/.swiftpm/
 # Environment
 .env
 /Python/bridges/
+
+# Build / packaging artifacts
+.build/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
