@@ -1,5 +1,9 @@
 # MeshSocket (Python)
 
+[![PyPI](https://img.shields.io/pypi/v/meshsocket.svg)](https://pypi.org/project/meshsocket/)
+[![Downloads](https://static.pepy.tech/badge/meshsocket)](https://pepy.tech/project/meshsocket)
+[![Python versions](https://img.shields.io/pypi/pyversions/meshsocket.svg)](https://pypi.org/project/meshsocket/)
+
 A lightweight WebSocket **mesh networking** library. Nodes connect to a central relay and
 communicate by **broadcast**, **direct routing**, and **request/response** — all over a
 simple JSON wire protocol.
