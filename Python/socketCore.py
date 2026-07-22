@@ -110,6 +110,10 @@ class MeshSocket:
 
         # State
         self.is_running = False
+        # Set by stop(reason=...) when the client is being torn down because of a
+        # FAULT rather than an ordinary shutdown; surfaced when the supervisor exits.
+        self.stopped_reason: Optional[str] = None
+        self._maintain_task: Optional[asyncio.Task] = None
 
         # Lazy-initialised inside the event loop to avoid DeprecationWarning
         # in Python 3.10+ when constructing outside an async context.
@@ -202,12 +206,25 @@ class MeshSocket:
             raise ValueError("Cannot use start() without a URL.")
         self._start_time = time.time()
         self.is_running = True
-        asyncio.create_task(self._maintain_connection())
+        self.stopped_reason = None
+        # Hold the reference: the loop keeps only a weak one, so an unreferenced
+        # task can be garbage-collected mid-flight and take the reconnect
+        # supervisor down silently.
+        self._maintain_task = asyncio.create_task(self._maintain_connection())
 
     async def wait_until_ready(self):
         await self.connected_event.wait()
 
-    async def stop(self):
+    async def stop(self, reason: str = None):
+        """Shut the client down for good (the supervisor will NOT reconnect).
+
+        `reason` marks this as a FAULT rather than an intentional shutdown: it
+        is recorded on `stopped_reason` and logged at ERROR when the supervisor
+        exits. Callers giving up on a socket should always pass one — a caller
+        that reuses the plain shutdown path to mean "fatal error" produces a
+        dead client that never reconnects and never says why.
+        """
+        self.stopped_reason = reason
         self.is_running = False
         if self.connection:
             await self.connection.close()
@@ -227,6 +244,28 @@ class MeshSocket:
 
     # --- INTERNAL CORE ---
     async def _maintain_connection(self):
+        try:
+            await self._maintain_connection_inner()
+        finally:
+            # INVARIANT: this supervisor never dies quietly. While it is alive the
+            # client reconnects forever; once it exits the client is dead until
+            # something calls start() again, so every exit — intentional shutdown,
+            # fault, cancellation, or a bug — must leave a line in the log. A
+            # silent exit here once cost ~30 h of a "connected" client that was
+            # never coming back.
+            if self.stopped_reason:
+                logging.error(f"{LogColors.FAIL}{self.name} connection supervisor "
+                              f"STOPPED: {self.stopped_reason} — this client will "
+                              f"not reconnect until start() is called again"
+                              f"{LogColors.ENDC}")
+            elif self.is_running:
+                logging.error(f"{LogColors.FAIL}{self.name} connection supervisor "
+                              f"exited unexpectedly while still running — this "
+                              f"client will NOT reconnect{LogColors.ENDC}")
+            else:
+                logging.info(f"{self.name} connection supervisor stopped (shutdown)")
+
+    async def _maintain_connection_inner(self):
         retry_delay = 2
         while self.is_running:
             listen_task = None
