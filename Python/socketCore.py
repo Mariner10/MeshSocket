@@ -77,9 +77,22 @@ class MeshSocket:
                  can_route: bool | None = None,
                  can_cross_channel_route: bool | None = None,
                  can_monitor: bool | None = None,
-                 broadcast_scope: str | None = None):
+                 broadcast_scope: str | None = None,
+                 ping_interval: float | None = 30.0,
+                 ping_timeout: float | None = 10.0,
+                 close_timeout: float | None = 5.0):
 
         self.url = url
+        # Client keepalive: a WebSocket ping every `ping_interval` seconds; if
+        # the pong takes longer than `ping_timeout` the socket is closed (1011)
+        # and the supervisor reconnects. None disables (library default was an
+        # implicit 20/20). The relay pings independently.
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
+        # How long to wait for the peer's close frame once WE decide to close
+        # (e.g. after a pong timeout). A dead peer never answers, so this bounds
+        # how long a detected-dead socket lingers before the supervisor redials.
+        self.close_timeout = close_timeout
         self.connection = connection
         self.auth_token = auth_token or os.getenv('MESH_AUTH_TOKEN')
         self.channel = channel or os.getenv("MESH_CHANNEL")
@@ -320,7 +333,10 @@ class MeshSocket:
             try:
                 logging.info(f"{LogColors.BLUE}{self.name} connecting to {self.safe_url}...{LogColors.ENDC}")
                 ssl_context = ssl.create_default_context(cafile=certifi.where()) if self.url.startswith("wss://") else None
-                async with websockets.connect(self.url, ssl=ssl_context) as ws:
+                async with websockets.connect(self.url, ssl=ssl_context,
+                                              ping_interval=self.ping_interval,
+                                              ping_timeout=self.ping_timeout,
+                                              close_timeout=self.close_timeout) as ws:
                     self.connection = ws
                     retry_delay = 2
 

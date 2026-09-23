@@ -5,6 +5,33 @@ final class MeshSocketIntegrationTests: XCTestCase {
     static let serverURL = ProcessInfo.processInfo.environment["MESH_SERVER_URL"] ?? "ws://localhost:8765"
     static let authToken = ProcessInfo.processInfo.environment["MESH_AUTH_TOKEN"] ?? "test-token"
 
+    /// These tests need a live relay (see test.sh). Skip, rather than hang, when
+    /// nothing is listening at `serverURL`, so `swift test` passes offline.
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        guard let url = URL(string: Self.serverURL), let host = url.host else {
+            throw XCTSkip("MESH_SERVER_URL is not a URL")
+        }
+        let port = url.port ?? (url.scheme == "wss" ? 443 : 80)
+        if !Self.isReachable(host: host, port: port) {
+            throw XCTSkip("no MeshSocket relay at \(Self.serverURL); run ./test.sh or start Python/socket_server.py")
+        }
+    }
+
+    private static func isReachable(host: String, port: Int) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var tv = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_STREAM, ai_protocol: 0,
+                             ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var info: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, String(port), &hints, &info) == 0, let addr = info else { return false }
+        defer { freeaddrinfo(info) }
+        return connect(fd, addr.pointee.ai_addr, addr.pointee.ai_addrlen) == 0
+    }
+
     private func makeSocket(
         name: String = "SwiftTest",
         channel: String? = nil,
@@ -95,20 +122,17 @@ final class MeshSocketIntegrationTests: XCTestCase {
 
     // MARK: - Handshake
 
-    func testHandshakeLatency() async throws {
+    /// Since 0.2.0 `handshake` / `status_request` are client-side service verbs:
+    /// the relay no longer answers them (they were reachable pre-auth and leaked
+    /// uptime/id). A request must time out rather than get a reply.
+    func testHandshakeIsNotAnsweredByRelay() async throws {
         let socket = makeSocket()
         await socket.start()
         await socket.waitUntilReady()
 
         let t = Date().timeIntervalSince1970
-        let result = await socket.request("handshake", payload: ["t": t])
-        let dict = result as? [String: Any]
-        XCTAssertNotNil(dict)
-        XCTAssertNotNil(dict?["l"])
-
-        if let latency = dict?["l"] as? Double {
-            XCTAssertLessThan(latency, 5.0, "Latency should be reasonable")
-        }
+        let result = await socket.request("handshake", payload: ["t": t], timeout: 1.0)
+        XCTAssertNil(result, "relay must not answer handshake")
 
         await socket.stop()
     }

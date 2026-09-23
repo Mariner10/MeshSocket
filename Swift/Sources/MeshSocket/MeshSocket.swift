@@ -28,9 +28,21 @@ public actor MeshSocket {
     private let rateLimit: Int
     private var msgTimes: [Date] = []
 
-    private var webSocketTask: URLSessionWebSocketTask?
+    /// The live transport for the current connection attempt (nil while down).
+    private var transport: (any MeshTransport)?
+    /// One session per socket, invalidated in deinit (was one per attempt, leaked).
+    private let session: URLSession
+    private let transportFactory: MeshTransportFactory
     private var isRunning = false
     private var startTime: Date?
+
+    // Keepalive: every `pingInterval` seconds send a ping; if no pong arrives
+    // within `pongTimeout` the transport is torn down through the same path the
+    // read loop uses, so backoff/reconnect runs and `onDisconnect` fires once.
+    public let pingInterval: TimeInterval
+    public let pongTimeout: TimeInterval
+    private var keepaliveTask: Task<Void, Never>?
+    private var keepalivePaused = false
 
     var handlers: [String: @Sendable (Any?) async -> Any?] = [:]
     private var pendingRequests: [String: CheckedContinuation<Any?, Error>] = [:]
@@ -64,13 +76,84 @@ public actor MeshSocket {
         maxOfflineBuffer: Int = 0,
         offlineFilePath: String? = nil,
         onReconnect: (@Sendable () async -> Void)? = nil,
-        onDisconnect: (@Sendable () async -> Void)? = nil
+        onDisconnect: (@Sendable () async -> Void)? = nil,
+        pingInterval: TimeInterval = 30,
+        pongTimeout: TimeInterval = 10
     ) {
+        // Kept non-failable for source compatibility; callers that cannot
+        // pre-validate the URL should use `init(validating:)` instead.
         guard let parsed = URL(string: url) else {
             fatalError("Invalid MeshSocket URL: \(url)")
         }
-        self.url = parsed
+        self.init(parsedURL: parsed, name: name, authToken: authToken, rateLimit: rateLimit,
+                  channel: channel, role: role, canBroadcast: canBroadcast, canRoute: canRoute,
+                  canCrossChannelRoute: canCrossChannelRoute, canMonitor: canMonitor,
+                  broadcastScope: broadcastScope, maxOfflineBuffer: maxOfflineBuffer,
+                  offlineFilePath: offlineFilePath, onReconnect: onReconnect,
+                  onDisconnect: onDisconnect, pingInterval: pingInterval, pongTimeout: pongTimeout,
+                  transportFactory: MeshTransports.urlSession)
+    }
+
+    /// Throwing variant: `MeshSocketError.invalidURL` instead of a crash on a bad URL.
+    public init(
+        validating url: String,
+        name: String = "Node",
+        authToken: String? = nil,
+        rateLimit: Int = 0,
+        channel: String? = nil,
+        role: String? = nil,
+        canBroadcast: Bool? = nil,
+        canRoute: Bool? = nil,
+        canCrossChannelRoute: Bool? = nil,
+        canMonitor: Bool? = nil,
+        broadcastScope: String? = nil,
+        maxOfflineBuffer: Int = 0,
+        offlineFilePath: String? = nil,
+        onReconnect: (@Sendable () async -> Void)? = nil,
+        onDisconnect: (@Sendable () async -> Void)? = nil,
+        pingInterval: TimeInterval = 30,
+        pongTimeout: TimeInterval = 10
+    ) throws {
+        guard let parsed = URL(string: url), let scheme = parsed.scheme?.lowercased(),
+              ["ws", "wss"].contains(scheme), parsed.host != nil else {
+            throw MeshSocketError.invalidURL
+        }
+        self.init(parsedURL: parsed, name: name, authToken: authToken, rateLimit: rateLimit,
+                  channel: channel, role: role, canBroadcast: canBroadcast, canRoute: canRoute,
+                  canCrossChannelRoute: canCrossChannelRoute, canMonitor: canMonitor,
+                  broadcastScope: broadcastScope, maxOfflineBuffer: maxOfflineBuffer,
+                  offlineFilePath: offlineFilePath, onReconnect: onReconnect,
+                  onDisconnect: onDisconnect, pingInterval: pingInterval, pongTimeout: pongTimeout,
+                  transportFactory: MeshTransports.urlSession)
+    }
+
+    /// Designated initializer. `transportFactory` is how tests inject a fake socket.
+    init(
+        parsedURL: URL,
+        name: String,
+        authToken: String?,
+        rateLimit: Int,
+        channel: String?,
+        role: String?,
+        canBroadcast: Bool?,
+        canRoute: Bool?,
+        canCrossChannelRoute: Bool?,
+        canMonitor: Bool?,
+        broadcastScope: String?,
+        maxOfflineBuffer: Int,
+        offlineFilePath: String?,
+        onReconnect: (@Sendable () async -> Void)?,
+        onDisconnect: (@Sendable () async -> Void)?,
+        pingInterval: TimeInterval,
+        pongTimeout: TimeInterval,
+        transportFactory: @escaping MeshTransportFactory
+    ) {
+        self.url = parsedURL
         self.name = name
+        self.pingInterval = pingInterval
+        self.pongTimeout = pongTimeout
+        self.session = URLSession(configuration: .default)
+        self.transportFactory = transportFactory
         self.id = UUID().uuidString
         self.authToken = authToken ?? ProcessInfo.processInfo.environment["MESH_AUTH_TOKEN"]
         self.channel = channel ?? ProcessInfo.processInfo.environment["MESH_CHANNEL"]
@@ -107,6 +190,11 @@ public actor MeshSocket {
         }
     }
 
+    deinit {
+        keepaliveTask?.cancel()
+        session.finishTasksAndInvalidate()
+    }
+
     // MARK: - Public API
 
     public func start() async {
@@ -120,10 +208,11 @@ public actor MeshSocket {
 
     public func stop() async {
         isRunning = false
+        stopKeepalive()
         listenTask?.cancel()
         listenTask = nil
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
-        webSocketTask = nil
+        transport?.cancel(with: .goingAway, reason: nil)
+        transport = nil
         connectionTask?.cancel()
         connectionTask = nil
         setDisconnected()
@@ -149,9 +238,9 @@ public actor MeshSocket {
         let msgID = UUID().uuidString
         let packet = buildPacket(id: msgID, type: type, payload: payload, replyTo: replyTo)
 
-        if _isConnected, let ws = webSocketTask {
+        if _isConnected, let ws = transport {
             do {
-                try await ws.send(.string(packet))
+                try await ws.send(packet)
                 return msgID
             } catch {
                 // Fall through to buffering
@@ -203,9 +292,9 @@ public actor MeshSocket {
     /// no buffering), fail the pending request right away instead of letting the
     /// caller wait out the timeout.
     private func transmit(_ packet: String, for msgID: String) async {
-        if _isConnected, let ws = webSocketTask {
+        if _isConnected, let ws = transport {
             do {
-                try await ws.send(.string(packet))
+                try await ws.send(packet)
                 return
             } catch {
                 // Fall through to buffering.
@@ -248,18 +337,13 @@ public actor MeshSocket {
             var loop: Task<Void, Never>?
             var didSignalUp = false
             do {
-                let session = URLSession(configuration: .default)
-                let ws = session.webSocketTask(with: url)
+                let ws = transportFactory(url, session)
                 ws.resume()
 
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    ws.sendPing { error in
-                        if let error { cont.resume(throwing: error) }
-                        else { cont.resume() }
-                    }
-                }
+                // Connectivity probe: the first pong proves the socket is open.
+                try await ws.sendPing()
 
-                webSocketTask = ws
+                transport = ws
                 resetAdmission()
 
                 // Send identify directly: the socket is open but not yet admitted,
@@ -267,7 +351,7 @@ public actor MeshSocket {
                 // would not transmit.
                 let identifyPacket = buildPacket(id: UUID().uuidString, type: "identify",
                                                  payload: buildIdentityPayload(), replyTo: nil)
-                try await ws.send(.string(identifyPacket))
+                try await ws.send(identifyPacket)
 
                 // Run the receive loop while we wait, so the server's `welcome` — or
                 // a close that rejects the identify (e.g. a name conflict) — is
@@ -295,6 +379,7 @@ public actor MeshSocket {
 
                 _isConnected = true
                 retryDelay = 2
+                startKeepalive(for: ws)
                 await flushOfflineQueue()
                 signalReady()
                 didSignalUp = true
@@ -312,8 +397,9 @@ public actor MeshSocket {
                 loop?.cancel()
             }
 
+            stopKeepalive()
             setDisconnected()
-            webSocketTask = nil
+            transport = nil
             failAllPendingRequests()
 
             // Pair the down-edge with the up-edge: only report a disconnect for a
@@ -334,7 +420,7 @@ public actor MeshSocket {
         }
     }
 
-    private func listenLoop(ws: URLSessionWebSocketTask) async {
+    private func listenLoop(ws: any MeshTransport) async {
         while isRunning {
             do {
                 let message = try await ws.receive()
@@ -404,6 +490,71 @@ public actor MeshSocket {
         if let response, let msgID {
             _ = try? await send(msgType, payload: response, replyTo: msgID)
         }
+    }
+
+    // MARK: - Keepalive
+
+    /// Stop sending keepalive pings (e.g. while the app is backgrounded and iOS
+    /// has suspended the socket anyway). A missed pong while paused never tears
+    /// the connection down.
+    public func pauseKeepalive() {
+        keepalivePaused = true
+    }
+
+    /// Resume keepalive pings after `pauseKeepalive()`.
+    public func resumeKeepalive() {
+        keepalivePaused = false
+    }
+
+    private func startKeepalive(for ws: any MeshTransport) {
+        keepaliveTask?.cancel()
+        guard pingInterval > 0 else { keepaliveTask = nil; return }
+        let interval = pingInterval
+        let timeout = pongTimeout
+        keepaliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: MeshSocket.nanoseconds(interval))
+                if Task.isCancelled { return }
+                guard let self else { return }
+                if await self.keepalivePaused { continue }
+                let alive = await MeshSocket.probe(ws, timeout: timeout)
+                if Task.isCancelled { return }
+                if !alive {
+                    await self.transportDown(ws)
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopKeepalive() {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+    }
+
+    /// One ping, racing the pong against `timeout`. False on timeout or error.
+    private static func probe(_ ws: any MeshTransport, timeout: TimeInterval) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do { try await ws.sendPing(); return true } catch { return false }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: MeshSocket.nanoseconds(max(timeout, 0.001)))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// The keepalive decided `ws` is dead. Cancelling it makes the read loop's
+    /// `receive()` throw, which ends the listen task and lets `maintainConnection`
+    /// run its normal down path (onDisconnect once, backoff, reconnect). A stale
+    /// keepalive from an earlier attempt must never touch the current transport.
+    private func transportDown(_ ws: any MeshTransport) {
+        guard let current = transport, current === ws else { return }
+        ws.cancel(with: .abnormalClosure, reason: "pong timeout".data(using: .utf8))
     }
 
     // MARK: - Ready State
@@ -532,7 +683,7 @@ public actor MeshSocket {
                 let content = try String(contentsOfFile: path, encoding: .utf8)
                 let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
                 for line in lines {
-                    try? await webSocketTask?.send(.string(line))
+                    try? await transport?.send(line)
                 }
                 try FileManager.default.removeItem(atPath: path)
             } catch {
@@ -542,7 +693,7 @@ public actor MeshSocket {
 
         if !ramBuffer.isEmpty {
             for packet in ramBuffer {
-                try? await webSocketTask?.send(.string(packet))
+                try? await transport?.send(packet)
             }
             ramBuffer.removeAll()
         }
