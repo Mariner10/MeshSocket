@@ -176,30 +176,56 @@ public actor MeshSocket {
             await waitUntilReady()
         }
 
+        let msgID = UUID().uuidString
+        let packet = buildPacket(id: msgID, type: type, payload: payload, replyTo: nil)
+        let deadline = Self.nanoseconds(seconds)
+
         do {
-            let msgID = try await send(type, payload: payload)
-            return try await withThrowingTaskGroup(of: Any?.self) { group in
-                group.addTask { [self] in
-                    try await withCheckedThrowingContinuation { continuation in
-                        Task { await self.storeContinuation(continuation, for: msgID) }
-                    }
+            return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Any?, Error>) in
+                // Register the pending id BEFORE the frame leaves. This closure runs
+                // synchronously on the actor, so a reply cannot arrive between the
+                // send and the registration and be dropped as unmatched.
+                pendingRequests[msgID] = continuation
+                Task { [weak self] in
+                    await self?.transmit(packet, for: msgID)
                 }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                    return nil
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: deadline)
+                    await self?.removePending(msgID)
                 }
-
-                guard let first = try await group.next() else { return nil }
-                group.cancelAll()
-
-                if first == nil {
-                    await removePending(msgID)
-                }
-                return first
             }
         } catch {
             return nil
         }
+    }
+
+    /// Send an already-built request frame; if it cannot leave (not connected and
+    /// no buffering), fail the pending request right away instead of letting the
+    /// caller wait out the timeout.
+    private func transmit(_ packet: String, for msgID: String) async {
+        if _isConnected, let ws = webSocketTask {
+            do {
+                try await ws.send(.string(packet))
+                return
+            } catch {
+                // Fall through to buffering.
+            }
+        }
+        if maxOfflineBuffer > 0 {
+            await handleOfflineBuffering(packet)
+            return
+        }
+        if let c = pendingRequests.removeValue(forKey: msgID) {
+            c.resume(throwing: MeshSocketError.notConnected)
+        }
+    }
+
+    /// Clamp a caller-supplied interval into nanoseconds without trapping on a
+    /// negative, NaN or absurd value.
+    static func nanoseconds(_ seconds: TimeInterval) -> UInt64 {
+        guard !seconds.isNaN, seconds > 0 else { return 0 }
+        let clamped = min(seconds, 86_400 * 365)
+        return UInt64(clamped * 1_000_000_000)
     }
 
     public func reportStatus(metrics: [String: Any] = [:]) async throws {
@@ -347,14 +373,19 @@ public actor MeshSocket {
         }
     }
 
-    private func processPacket(_ packet: [String: Any]) async {
+    func processPacket(_ packet: [String: Any]) async {
         let msgID = packet["id"] as? String
         let msgType = packet["type"] as? String
         let payload = packet["payload"]
         let replyTo = packet["reply_to"] as? String
 
-        if let replyTo, let continuation = pendingRequests.removeValue(forKey: replyTo) {
-            continuation.resume(returning: payload)
+        if let replyTo {
+            // A reply is only ever a reply. One that matches no pending request
+            // (late, duplicate or forged) is dropped, never re-dispatched as a
+            // fresh request of its `type`.
+            if let continuation = pendingRequests.removeValue(forKey: replyTo) {
+                continuation.resume(returning: payload)
+            }
             return
         }
 
@@ -427,17 +458,13 @@ public actor MeshSocket {
             }
             admitContinuation = cont
             Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                try? await Task.sleep(nanoseconds: MeshSocket.nanoseconds(timeout))
                 await self?.failAdmission()
             }
         }
     }
 
     // MARK: - Pending Requests
-
-    private func storeContinuation(_ continuation: CheckedContinuation<Any?, Error>, for id: String) {
-        pendingRequests[id] = continuation
-    }
 
     private func removePending(_ id: String) {
         if let c = pendingRequests.removeValue(forKey: id) {

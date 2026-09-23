@@ -1,28 +1,90 @@
 import asyncio
+import hmac
+import re
 import uuid
 import websockets
 from socketCore import MeshSocket, LogColors
 import logging
 import os
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set
 
-_MAX_PENDING_PER_IP = 10
-_pending_conns: Dict[str, int] = {}
+# Identity grammar shared with the carter-relay gateway. Raw client names and
+# channels are plain identifiers; the gateway emits `<account digits>.<ident>`.
+# Anything else is closed with 1008 — names are echoed into every roster push,
+# the welcome frame and the logs, so they must be short and printable.
+IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+NAMESPACED_RE = re.compile(r"^[0-9]{1,32}\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def valid_ident(value: Any) -> bool:
+    return isinstance(value, str) and bool(IDENT_RE.match(value) or NAMESPACED_RE.match(value))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning(f"{name}={raw!r} is not an integer; using {default}")
+        return default
+
+
+def _env_set(name: str) -> Set[str]:
+    return {item.strip() for item in os.getenv(name, "").split(",") if item.strip()}
 
 
 class MeshServer:
+    # Per-peer send budget for fan-outs (roster + broadcast). A peer that cannot
+    # take a frame within this window is stalled or gone and gets reaped.
+    SEND_TIMEOUT = 2.0
+    # How long a routed request may wait on its target before the requester
+    # gets an explicit error reply.
+    ROUTE_TIMEOUT = 5.0
+    # Outstanding `route_msg` requests one client may have in flight at once.
+    MAX_OUTSTANDING_ROUTES = 16
+    # How long an unidentified socket may sit before it is closed.
+    AUTH_TIMEOUT = 5.0
+
     def __init__(self,
                  host: str = "0.0.0.0",
                  port: int = 8765,
-                 rate_limit: int = 0,
-                 max_size: int = 1_048_576,
+                 rate_limit: Optional[int] = None,
+                 max_size: Optional[int] = None,
                  auth_handler: Optional[Callable] = None,
                  on_startup: Optional[Callable] = None,
-                 on_authenticated: Optional[Callable] = None):
+                 on_authenticated: Optional[Callable] = None,
+                 max_connections: Optional[int] = None,
+                 max_pending_per_ip: Optional[int] = None,
+                 trusted_proxies: Optional[Set[str]] = None,
+                 ping_interval: Optional[float] = 20.0,
+                 ping_timeout: Optional[float] = 20.0):
         self.host = host
         self.port = port
-        self.rate_limit = rate_limit
-        self.max_size = max_size
+        # Limits: constructor argument, else MESH_* environment knob, else default.
+        #   MESH_RATE_LIMIT          inbound frames per second per connection (50)
+        #   MESH_MAX_SIZE            largest inbound frame in bytes (256 KiB)
+        #   MESH_MAX_CONNECTIONS     open sockets, identified or not (2000)
+        #   MESH_MAX_PENDING_PER_IP  unidentified sockets per client IP (10)
+        #   MESH_TRUSTED_PROXIES     comma list of proxy IPs whose X-Forwarded-For /
+        #                            X-Real-IP is believed (default: none)
+        self.rate_limit = rate_limit if rate_limit is not None else _env_int("MESH_RATE_LIMIT", 50)
+        self.max_size = max_size if max_size is not None else _env_int("MESH_MAX_SIZE", 256 * 1024)
+        self.max_connections = (max_connections if max_connections is not None
+                                else _env_int("MESH_MAX_CONNECTIONS", 2000))
+        self.max_pending_per_ip = (max_pending_per_ip if max_pending_per_ip is not None
+                                   else _env_int("MESH_MAX_PENDING_PER_IP", 10))
+        self.trusted_proxies = (set(trusted_proxies) if trusted_proxies is not None
+                                else _env_set("MESH_TRUSTED_PROXIES"))
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
+
+        # Counters. `_pending_by_ip` counts sockets that have NOT yet resolved
+        # auth (decremented the moment `authenticated` resolves, not at
+        # disconnect); `_open_conns` counts every accepted socket until it closes.
+        self._pending_by_ip: Dict[str, int] = {}
+        self._open_conns = 0
 
         # auth_handler(token, remote_ip) → bool
         # Default: compare against MESH_AUTH_TOKEN env var.
@@ -42,11 +104,13 @@ class MeshServer:
         self._server = None
 
     @staticmethod
-    def _default_auth(token: str, remote_ip: str) -> bool:
+    def _default_auth(token: Any, remote_ip: str) -> bool:
         server_token = os.getenv("MESH_AUTH_TOKEN")
         if not server_token:
             return True
-        return token == server_token
+        if not isinstance(token, str):
+            return False
+        return hmac.compare_digest(token.encode("utf-8"), server_token.encode("utf-8"))
 
     def _parse_bool(self, value: Any, default: bool = False) -> bool:
         if isinstance(value, bool):
@@ -71,25 +135,50 @@ class MeshServer:
             "role": getattr(client, "role", "node"),
         }
 
-    def _client_ip(self, websocket) -> str:
+    @staticmethod
+    def _request_headers(websocket):
         request_headers = getattr(websocket, "request_headers", None)
         if request_headers is None and getattr(websocket, "request", None) is not None:
             request_headers = websocket.request.headers
+        return request_headers
 
-        if request_headers:
-            x_real_ip = request_headers.get("X-Real-IP")
-            if x_real_ip:
-                return x_real_ip.strip()
+    def _client_ip(self, websocket) -> str:
+        peer = websocket.remote_address[0] if getattr(websocket, "remote_address", None) else "unknown"
 
-            x_forwarded_for = request_headers.get("X-Forwarded-For")
-            if x_forwarded_for:
-                first_hop = x_forwarded_for.split(",", 1)[0].strip()
-                if first_hop:
-                    return first_hop
+        # Forwarded-IP headers are attacker-controlled unless the socket comes
+        # from a proxy we run. Only then do they override the TCP peer address.
+        if peer in self.trusted_proxies:
+            request_headers = self._request_headers(websocket)
+            if request_headers:
+                x_real_ip = request_headers.get("X-Real-IP")
+                if x_real_ip and x_real_ip.strip():
+                    return x_real_ip.strip()
+                x_forwarded_for = request_headers.get("X-Forwarded-For")
+                if x_forwarded_for:
+                    first_hop = x_forwarded_for.split(",", 1)[0].strip()
+                    if first_hop:
+                        return first_hop
+        return peer
 
-        if websocket.remote_address:
-            return websocket.remote_address[0]
-        return "unknown"
+    @staticmethod
+    def _normalize_origin(origin: str) -> str:
+        return origin.strip().rstrip("/").lower()
+
+    def _origin_allowed(self, origin: Optional[str]) -> bool:
+        """Exact scheme+host+port match against MESH_ALLOWED_ORIGINS.
+
+        Non-browser clients send no Origin and are always allowed; a browser's
+        Origin must equal an allowed entry (no prefix matching, so
+        `http://localhost.evil.com` does not pass for `http://localhost`).
+        """
+        if not origin:
+            return True
+        allowed = {
+            self._normalize_origin(o)
+            for o in os.getenv("MESH_ALLOWED_ORIGINS", "http://127.0.0.1,http://localhost").split(",")
+            if o.strip()
+        }
+        return self._normalize_origin(origin) in allowed
 
     async def start(self):
         if self._on_startup:
@@ -100,6 +189,8 @@ class MeshServer:
             self.host,
             self.port,
             max_size=self.max_size,
+            ping_interval=self.ping_interval,
+            ping_timeout=self.ping_timeout,
         ) as server:
             self._server = server
             # Port 0 means "pick one" — record what the OS chose so tests and
@@ -115,8 +206,16 @@ class MeshServer:
         remote_ip = self._client_ip(websocket)
         logging.info(f"New connection from {remote_ip}")
 
-        pending = _pending_conns.get(remote_ip, 0)
-        if pending >= _MAX_PENDING_PER_IP:
+        if self._open_conns >= self.max_connections:
+            logging.warning(
+                f"{LogColors.FAIL}Rejected {remote_ip} — "
+                f"{self._open_conns} connections open (MESH_MAX_CONNECTIONS={self.max_connections}){LogColors.ENDC}"
+            )
+            await websocket.close(4429, "Too many connections")
+            return
+
+        pending = self._pending_by_ip.get(remote_ip, 0)
+        if pending >= self.max_pending_per_ip:
             logging.warning(
                 f"{LogColors.FAIL}Rejected {remote_ip} — "
                 f"{pending} pending connections already{LogColors.ENDC}"
@@ -124,7 +223,24 @@ class MeshServer:
             await websocket.close(4429, "Too many pending connections")
             return
 
-        _pending_conns[remote_ip] = pending + 1
+        self._open_conns += 1
+        self._pending_by_ip[remote_ip] = pending + 1
+        pending_released = False
+
+        def _release_pending(*_):
+            # Runs when auth resolves (either way) or at disconnect, whichever
+            # comes first — but only once. The pending counter measures sockets
+            # waiting on identify, NOT live connections.
+            nonlocal pending_released
+            if pending_released:
+                return
+            pending_released = True
+            left = self._pending_by_ip.get(remote_ip, 1) - 1
+            if left <= 0:
+                self._pending_by_ip.pop(remote_ip, None)
+            else:
+                self._pending_by_ip[remote_ip] = left
+
         try:
             client = MeshSocket(
                 connection=websocket,
@@ -139,24 +255,15 @@ class MeshServer:
             client.can_monitor = False
             client.broadcast_scope = "channel"
 
-            allowed_origins = {
-                origin.strip()
-                for origin in os.getenv(
-                    "MESH_ALLOWED_ORIGINS",
-                    "http://127.0.0.1,http://localhost"
-                ).split(",")
-                if origin.strip()
-            }
-            request_headers = getattr(websocket, "request_headers", None)
-            if request_headers is None and getattr(websocket, "request", None) is not None:
-                request_headers = websocket.request.headers
+            request_headers = self._request_headers(websocket)
             origin = request_headers.get("Origin") if request_headers else None
-            if origin and not any(origin == allowed or origin.startswith(allowed) for allowed in allowed_origins):
-                logging.warning(f"{LogColors.FAIL}Origin rejected: {origin}{LogColors.ENDC}")
+            if not self._origin_allowed(origin):
+                logging.warning(f"{LogColors.FAIL}Origin rejected: {origin!r}{LogColors.ENDC}")
                 await websocket.close(1008, "origin not allowed")
                 return
 
             authenticated: asyncio.Future = asyncio.get_running_loop().create_future()
+            authenticated.add_done_callback(_release_pending)
 
             def _admitted() -> bool:
                 return (authenticated.done() and not authenticated.cancelled()
@@ -195,6 +302,25 @@ class MeshServer:
                     await client.connection.close(1008, "unauthorized")
                     return
 
+                # Identity grammar: a missing channel means "default" (as does
+                # an empty one, matching the gateway); a missing name keeps the
+                # server-assigned placeholder. Anything present must match the
+                # shared regex — no empty names, no whitespace, no 900 KB names.
+                requested_channel = payload.get('channel')
+                if requested_channel is None or requested_channel == "":
+                    requested_channel = "default"
+                if not valid_ident(requested_name) or not valid_ident(requested_channel):
+                    logging.warning(
+                        f"{LogColors.FAIL}Invalid name/channel in identify from {remote_ip} — closing{LogColors.ENDC}"
+                    )
+                    if not authenticated.done():
+                        authenticated.set_result(False)
+                    await client.connection.close(1008, "invalid name or channel")
+                    return
+                requested_role = payload.get('role')
+                if not isinstance(requested_role, str) or not requested_role or len(requested_role) > 64:
+                    requested_role = "node"
+
                 incumbent = self.clients_by_name.get(requested_name)
                 if incumbent is not None and incumbent is not client:
                     # Last-writer-wins: a reconnecting peer reclaims its name. The
@@ -221,13 +347,16 @@ class MeshServer:
                 client.id = new_id
                 client.freeze_id()
                 client.name = requested_name
-                client.channel = payload.get('channel') or "default"
-                client.role = payload.get('role') or "node"
+                client.channel = requested_channel
+                client.role = requested_role
                 client.can_broadcast = self._parse_bool(payload.get('can_broadcast'), client.role in {"dashboard", "browser", "mobile", "node"})
                 client.can_route = self._parse_bool(payload.get('can_route'), client.role in {"browser", "mobile", "dashboard", "node"})
                 client.can_cross_channel_route = self._parse_bool(payload.get('can_cross_channel_route'), False)
                 client.can_monitor = self._parse_bool(payload.get('can_monitor'), client.role in {"dashboard", "browser"})
-                client.broadcast_scope = payload.get('broadcast_scope') or ("global" if client.can_monitor else "channel")
+                requested_scope = payload.get('broadcast_scope')
+                if requested_scope not in ("global", "channel"):
+                    requested_scope = "global" if client.can_monitor else "channel"
+                client.broadcast_scope = requested_scope
 
                 logging.info(
                     f"{LogColors.GREEN}Identified: '{client.name}' → {client.id}{LogColors.ENDC}"
@@ -302,21 +431,39 @@ class MeshServer:
                 await self.broadcast("node_status", payload, sender=client)
                 return {"status": "broadcasted"}
 
+            outstanding_routes = 0
+
             @client.on('route_msg')
             async def on_route(payload):
+                nonlocal outstanding_routes
+                if not isinstance(payload, dict):
+                    return {"error": "malformed route", "status": "failed"}
                 target_id = payload.get('target_id')
                 msg_type = payload.get('type')
                 data = payload.get('payload')
+                if not isinstance(target_id, str) or not isinstance(msg_type, str):
+                    return {"error": "malformed route", "status": "failed"}
 
                 target = self.clients.get(target_id)
-                if target:
-                    if not client.can_route:
-                        return {"error": "routing not allowed", "status": "failed"}
-                    if not client.can_cross_channel_route and not self._same_channel(client, target):
-                        return {"error": "cross-channel route denied", "status": "failed"}
-                    response = await target.request(msg_type, data, timeout=5.0)
-                    return response
-                return {"error": "Target not found", "status": "failed"}
+                if not target:
+                    return {"error": "Target not found", "status": "failed"}
+                if not client.can_route:
+                    return {"error": "routing not allowed", "status": "failed"}
+                if not client.can_cross_channel_route and not self._same_channel(client, target):
+                    return {"error": "cross-channel route denied", "status": "failed"}
+                if outstanding_routes >= self.MAX_OUTSTANDING_ROUTES:
+                    return {"error": "too many outstanding routes", "status": "failed"}
+
+                outstanding_routes += 1
+                try:
+                    response = await target.request(msg_type, data, timeout=self.ROUTE_TIMEOUT)
+                finally:
+                    outstanding_routes -= 1
+                if response is None:
+                    # The target never answered: say so instead of leaving the
+                    # requester to wait out its own timeout with no signal.
+                    return {"error": "target timeout", "status": "failed"}
+                return response
 
             @client.on("get_nodes")
             async def on_get_nodes(payload):
@@ -329,9 +476,13 @@ class MeshServer:
 
             @client.on('route_msg_noreply')
             async def on_noreply_route(payload):
+                if not isinstance(payload, dict):
+                    return {"error": "malformed route", "status": "failed"}
                 target_name = payload.get('target_name')
                 msg_type = payload.get('type')
                 data = payload.get('payload')
+                if not isinstance(target_name, str) or not isinstance(msg_type, str):
+                    return {"error": "malformed route", "status": "failed"}
 
                 target = self.clients_by_name.get(target_name)
                 if target:
@@ -351,7 +502,7 @@ class MeshServer:
             )
 
             try:
-                is_auth = await asyncio.wait_for(authenticated, timeout=5.0)
+                is_auth = await asyncio.wait_for(authenticated, timeout=self.AUTH_TIMEOUT)
             except asyncio.TimeoutError:
                 logging.warning(
                     f"{LogColors.FAIL}Auth timeout for {remote_ip} — closing silently{LogColors.ENDC}"
@@ -395,7 +546,8 @@ class MeshServer:
                 )
                 await self._broadcast_client_list()
         finally:
-            _pending_conns[remote_ip] = max(0, _pending_conns.get(remote_ip, 1) - 1)
+            _release_pending()
+            self._open_conns = max(0, self._open_conns - 1)
 
     # Per-peer send budget for fan-outs. A peer that cannot take a frame within
     # this window is stalled or gone; it is reaped so it cannot hold up the

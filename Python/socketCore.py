@@ -390,8 +390,9 @@ class MeshSocket:
         return False
 
     # --- SEND LOGIC ---
-    async def send(self, type: str, payload: Any = None, reply_to: str = None) -> Optional[str]:
-        msg_id = str(uuid.uuid4())
+    async def send(self, type: str, payload: Any = None, reply_to: str = None,
+                   msg_id: str = None) -> Optional[str]:
+        msg_id = msg_id or str(uuid.uuid4())
         packet = {"id": msg_id, "type": type, "payload": payload, "reply_to": reply_to}
         packet_str = json.dumps(packet)
 
@@ -465,16 +466,24 @@ class MeshSocket:
             logging.warning(f"Request '{type}' waiting for connection...")
             await self.connected_event.wait()
 
-        msg_id = await self.send(type, payload)
+        # Register the pending id BEFORE the frame leaves, so a reply that
+        # arrives faster than we can get back here is matched, not dropped.
+        msg_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._pending_requests[msg_id] = future
+        try:
+            await self.send(type, payload, msg_id=msg_id)
+        except BaseException:
+            self._pending_requests.pop(msg_id, None)
+            raise
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             self._pending_requests.pop(msg_id, None)
             return None
         except asyncio.CancelledError:
+            self._pending_requests.pop(msg_id, None)
             return None
 
     def _fail_all_pending_requests(self):
@@ -482,7 +491,20 @@ class MeshSocket:
             if not future.done(): future.cancel()
         self._pending_requests.clear()
 
+    # Inbound handler tasks in flight per connection. When all slots are busy
+    # the read loop waits, which lets the websocket's own buffer apply
+    # backpressure to the peer instead of spawning unbounded tasks.
+    MAX_INFLIGHT = 64
+
     async def _listen_loop(self):
+        inflight = asyncio.Semaphore(self.MAX_INFLIGHT)
+
+        async def run(packet):
+            try:
+                await self._process_packet(packet)
+            finally:
+                inflight.release()
+
         async for message in self.connection:
             if self.rate_limit > 0:
                 now = time.time()
@@ -494,9 +516,10 @@ class MeshSocket:
 
             try:
                 data = json.loads(message)
-                asyncio.create_task(self._process_packet(data))
-            except json.JSONDecodeError:
-                pass
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            await inflight.acquire()
+            asyncio.create_task(run(data))
 
     async def _process_packet(self, packet: dict):
         if not isinstance(packet, dict):
@@ -510,10 +533,14 @@ class MeshSocket:
         # socket the gate has not admitted.
         if self.authorize is not None and not self.authorize(msg_type):
             return
-        if reply_to and reply_to in self._pending_requests:
-            future = self._pending_requests.pop(reply_to)
-            if not future.done(): future.set_result(payload)
-            return 
+        if reply_to:
+            # A reply is only ever a reply. One that matches no pending request
+            # (late, duplicate, or forged) is dropped — never re-dispatched as
+            # a fresh request of its `type`.
+            future = self._pending_requests.pop(reply_to, None)
+            if future is not None and not future.done():
+                future.set_result(payload)
+            return
         if msg_type in self.handlers:
             try:
                 response = await self.handlers[msg_type](payload)
