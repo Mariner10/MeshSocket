@@ -4,31 +4,68 @@ name: Publish to PyPI
 # (vX.Y.Z) is pushed. Uses PyPI Trusted Publishing (OIDC) — no API token is
 # stored anywhere; GitHub mints a short-lived credential at publish time.
 #
-# One-time setup (no token): add this repo + workflow as a trusted publisher for
-# the `meshsocket` project at https://pypi.org/manage/account/publishing/
+# Hardening (0.2.0):
+#   - every action is pinned to a commit SHA (the version is in the comment);
+#   - the publish job runs in the `pypi` GitHub environment. Configure it under
+#     Settings → Environments → pypi with a required reviewer, so a pushed tag
+#     alone cannot publish; and register that environment name on the PyPI
+#     trusted-publisher entry (it was blank before);
+#   - the test job must pass before anything is built or published.
+#
+# One-time setup: add this repo + workflow as a trusted publisher for the
+# `meshsocket` project at https://pypi.org/manage/account/publishing/
 #   PyPI project name: meshsocket
 #   Owner:             Mariner10
 #   Repository:        MeshSocket
 #   Workflow name:     publish.yml
-#   Environment:       (leave blank)
-# It can be added as a "pending" publisher before the first release exists.
+#   Environment:       pypi
 #
-# To release:  git tag v0.1.0 && git push origin v0.1.0
+# To release:  git tag v0.2.0 && git push origin v0.2.0
 
 on:
   push:
     tags:
       - "v*"
 
+permissions: {}
+
 jobs:
-  publish:
+  test:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write        # required for OIDC trusted publishing
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Run the test suite
+        working-directory: Python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "websockets==17.1" "certifi==2026.7.22" pytest pytest-asyncio
+          python -m pytest -q -p no:cacheprovider \
+            test_handlers.py test_supervisor.py \
+            test_server_hardening.py test_server_limits.py \
+            test_client_hygiene.py test_client_keepalive.py
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # required for OIDC trusted publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
@@ -39,6 +76,6 @@ jobs:
           python -m build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@fb13cb306901256ace3dab689990e13a5550ffaa # v1.11.0
         with:
           packages-dir: Python/dist

@@ -81,11 +81,30 @@ Add via Swift Package Manager:
 ## Running the Server
 
 ```bash
-pip install websockets
+pip install websockets certifi
 MESH_AUTH_TOKEN=your-token python Python/socket_server.py
 ```
 
-The server listens on `0.0.0.0:8765` by default. Set `MESH_ALLOWED_ORIGINS` to restrict WebSocket origins.
+The server listens on `0.0.0.0:8765` by default. Starting **without** `MESH_AUTH_TOKEN`
+admits every socket that can reach the port; since 0.2.0 that emits a `DeprecationWarning`
+unless you construct `MeshServer(allow_anonymous=True)`, and 0.3.0 will refuse to start
+(and bind `127.0.0.1` by default).
+
+Limits and knobs (environment variable, default):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MESH_AUTH_TOKEN` | unset | Shared token clients must present in `identify` (constant-time compare) |
+| `MESH_ALLOWED_ORIGINS` | `http://127.0.0.1,http://localhost` | Exact scheme+host+port match for browser `Origin` headers |
+| `MESH_MAX_CONNECTIONS` | `2000` | Open sockets, identified or not (4429 beyond) |
+| `MESH_MAX_PENDING_PER_IP` | `10` | Sockets per client IP that have not finished `identify` |
+| `MESH_RATE_LIMIT` | `50` | Inbound frames per second per connection (1008 beyond) |
+| `MESH_MAX_SIZE` | `262144` | Largest inbound frame in bytes (1009 beyond) |
+| `MESH_TRUSTED_PROXIES` | empty | Comma list of proxy IPs whose `X-Forwarded-For` / `X-Real-IP` are believed |
+
+Client `name` and `channel` must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (or the
+gateway's `<digits>.<ident>` form); anything else is closed with 1008. `identify` is
+accepted once per connection. See `CHANGELOG.md` for the full 0.2.0 behavior list.
 
 ## Testing
 
@@ -97,7 +116,7 @@ Cross-language integration tests verify the Swift client against the real Python
 
 This runs:
 1. `docker compose up` — starts the Python server + echo client
-2. `swift test` — runs 11 integration tests from the host
+2. `swift test` — runs the unit tests plus the integration tests from the host (the integration tests skip themselves when no relay is listening)
 3. `docker compose down` — tears down
 
 Requirements: Docker, Swift 5.9+.
