@@ -35,6 +35,12 @@ class MeshServer:
         self.clients: Dict[str, MeshSocket] = {}
         self.clients_by_name: Dict[str, MeshSocket] = {}
 
+        # Set once the listening socket is bound; `bound_port` is the real port
+        # (useful when constructed with port=0).
+        self.started = asyncio.Event()
+        self.bound_port: int = port
+        self._server = None
+
     @staticmethod
     def _default_auth(token: str, remote_ip: str) -> bool:
         server_token = os.getenv("MESH_AUTH_TOKEN")
@@ -94,7 +100,15 @@ class MeshServer:
             self.host,
             self.port,
             max_size=self.max_size,
-        ):
+        ) as server:
+            self._server = server
+            # Port 0 means "pick one" — record what the OS chose so tests and
+            # embedders can find the server.
+            try:
+                self.bound_port = server.sockets[0].getsockname()[1]
+            except Exception:
+                self.bound_port = self.port
+            self.started.set()
             await asyncio.Future()
 
     async def _handle_connection(self, websocket):
@@ -146,7 +160,17 @@ class MeshServer:
 
             @client.on('identify')
             async def handle_identify(payload):
-                payload = payload or {}
+                # identify is a one-shot. A second identify (valid token or not)
+                # would re-run name eviction and capability assignment against a
+                # client that is already registered, so it is a protocol violation.
+                if authenticated.done():
+                    logging.warning(
+                        f"{LogColors.FAIL}re-identify from '{client.name}' ({remote_ip}) — closing{LogColors.ENDC}"
+                    )
+                    await client.connection.close(1008, "identify already processed")
+                    return
+
+                payload = payload if isinstance(payload, dict) else {}
                 requested_name = payload.get('name', client.name)
                 client_token = payload.get('token', '')
 
@@ -156,6 +180,8 @@ class MeshServer:
                     )
                     if not authenticated.done():
                         authenticated.set_result(False)
+                    # Close now rather than letting the 5 s auth timer do it.
+                    await client.connection.close(1008, "unauthorized")
                     return
 
                 incumbent = self.clients_by_name.get(requested_name)
@@ -171,8 +197,10 @@ class MeshServer:
                         f"{LogColors.WARNING}Name '{requested_name}' reclaimed by {remote_ip} — "
                         f"evicting stale client {incumbent.id}{LogColors.ENDC}"
                     )
-                    self.clients.pop(incumbent.id, None)
-                    self.clients_by_name.pop(requested_name, None)
+                    if self.clients.get(incumbent.id) is incumbent:
+                        self.clients.pop(incumbent.id, None)
+                    if self.clients_by_name.get(requested_name) is incumbent:
+                        self.clients_by_name.pop(requested_name, None)
                     asyncio.create_task(incumbent.stop())
 
                 new_id = str(uuid.uuid4())
@@ -180,6 +208,7 @@ class MeshServer:
                     new_id = str(uuid.uuid4())
 
                 client.id = new_id
+                client.freeze_id()
                 client.name = requested_name
                 client.channel = payload.get('channel') or "default"
                 client.role = payload.get('role') or "node"
@@ -195,6 +224,13 @@ class MeshServer:
 
                 if self._on_authenticated:
                     self._on_authenticated(client, remote_ip, client_token)
+
+                # Register BEFORE welcome and the roster push, so the joiner is in
+                # the roster its peers receive and is routable from the moment it
+                # learns its id. (The connection handler below re-asserts this once
+                # `authenticated` resolves; both writes are identity-safe.)
+                self.clients[client.id] = client
+                self.clients_by_name[client.name] = client
 
                 if not authenticated.done():
                     authenticated.set_result(True)
@@ -327,10 +363,12 @@ class MeshServer:
             try:
                 await listen_task
             finally:
-                self.clients.pop(client.id, None)
-                # Only release the name if it still points at *this* client — an
-                # evicted incumbent must not pop the entry of the peer that just
-                # reclaimed its name (see the eviction path in handle_identify).
+                # Identity-checked pops: only release an entry that still points at
+                # *this* client. An evicted incumbent must not pop the entry of the
+                # peer that reclaimed its name, and no frame can have moved this
+                # client's id (it is frozen at registration).
+                if self.clients.get(client.id) is client:
+                    self.clients.pop(client.id, None)
                 if self.clients_by_name.get(client.name) is client:
                     self.clients_by_name.pop(client.name, None)
                 logging.info(

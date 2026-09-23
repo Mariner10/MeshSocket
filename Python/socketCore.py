@@ -93,7 +93,10 @@ class MeshSocket:
         else:
             self.name = name
 
-        self.id = str(uuid.uuid4())
+        # `id` is a property: the server freezes it once the client is registered
+        # (see `freeze_id`) so no later frame can move a node in the routing table.
+        self._id = str(uuid.uuid4())
+        self._id_frozen = False
 
         # Callbacks
         self.on_reconnect_callback = on_reconnect
@@ -130,10 +133,34 @@ class MeshSocket:
         self.handlers: Dict[str, Callable] = {}
         self._pending_requests: Dict[str, asyncio.Future] = {}
 
-        self.on("handshake", self._handle_handshake)
+        # Optional pre-dispatch gate: `authorize(msg_type) -> bool`. The server
+        # installs one per connection so unidentified sockets can reach nothing
+        # but `identify`; None means every registered handler is reachable.
+        self.authorize: Optional[Callable[[str], bool]] = None
+
+        # `ping` is answered in both modes. The rest are CLIENT-mode handlers:
+        # a server-side node must never let its peer rewrite its id via
+        # `welcome`, nor answer `handshake`/`status_request` before the server's
+        # own auth gate has admitted the socket.
         self.on("ping", self._handle_ping)
-        self.on("status_request", self._handle_status_request)
-        self.on("welcome", self._handle_welcome)
+        if connection is None:
+            self.on("handshake", self._handle_handshake)
+            self.on("status_request", self._handle_status_request)
+            self.on("welcome", self._handle_welcome)
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    @id.setter
+    def id(self, value: str):
+        if self._id_frozen:
+            raise AttributeError("MeshSocket.id is immutable once registered")
+        self._id = value
+
+    def freeze_id(self):
+        """Make `id` read-only. The server calls this right after registration."""
+        self._id_frozen = True
 
     @property
     def connected_event(self) -> asyncio.Event:
@@ -278,8 +305,10 @@ class MeshSocket:
                     retry_delay = 2
 
                     # Arm the admission gate before identify so a welcome delivered
-                    # by the concurrently-running listen loop can't be missed.
+                    # by the concurrently-running listen loop can't be missed. Each
+                    # attempt gets a fresh server-assigned id, so unfreeze it here.
                     self._admitted_event = asyncio.Event()
+                    self._id_frozen = False
 
                     # Send identify directly on the socket: connected_event is not
                     # set yet, so the normal send() path would buffer or raise.
@@ -487,13 +516,16 @@ class MeshSocket:
                 logging.error(f"Error processing {msg_type}: {e}")
 
     async def _handle_welcome(self, payload):
-        server_id = payload.get("id")
-        if server_id:
+        # Client mode only: a server-side node never accepts a peer's `welcome`
+        # (the handler is not registered there, and this guard is belt-and-braces).
+        if self._admitted_event is None:
+            return
+        server_id = payload.get("id") if isinstance(payload, dict) else None
+        if isinstance(server_id, str) and server_id and not self._id_frozen:
             logging.info(f"{self.name} assigned server ID: {server_id}")
             self.id = server_id
-        # Admit the connection (client mode). None in server mode.
-        if self._admitted_event is not None:
-            self._admitted_event.set()
+            self.freeze_id()
+        self._admitted_event.set()
 
     async def _handle_handshake(self, payload):
         t_remote = float(payload.get('t'))
