@@ -2,6 +2,7 @@ import asyncio
 import hmac
 import re
 import uuid
+import warnings
 import websockets
 from socketCore import MeshSocket, LogColors
 import logging
@@ -59,9 +60,14 @@ class MeshServer:
                  max_pending_per_ip: Optional[int] = None,
                  trusted_proxies: Optional[Set[str]] = None,
                  ping_interval: Optional[float] = 20.0,
-                 ping_timeout: Optional[float] = 20.0):
+                 ping_timeout: Optional[float] = 20.0,
+                 allow_anonymous: bool = False):
         self.host = host
         self.port = port
+        # Explicit opt-in for running without any token. 0.2.0 warns when the
+        # default auth handler has no MESH_AUTH_TOKEN and this is False;
+        # 0.3.0 will refuse to start (see CHANGELOG).
+        self.allow_anonymous = allow_anonymous
         # Limits: constructor argument, else MESH_* environment knob, else default.
         #   MESH_RATE_LIMIT          inbound frames per second per connection (50)
         #   MESH_MAX_SIZE            largest inbound frame in bytes (256 KiB)
@@ -180,7 +186,21 @@ class MeshServer:
         }
         return self._normalize_origin(origin) in allowed
 
+    def _auth_is_open(self) -> bool:
+        return self._auth_handler is self._default_auth and not os.getenv("MESH_AUTH_TOKEN")
+
     async def start(self):
+        if self._auth_is_open() and not self.allow_anonymous:
+            warnings.warn(
+                "MeshServer is starting WITHOUT authentication: MESH_AUTH_TOKEN is unset and no "
+                "auth_handler was given. Every socket that can reach this port is admitted. Set "
+                "MESH_AUTH_TOKEN, pass auth_handler=, or pass allow_anonymous=True to opt in "
+                "explicitly. MeshSocket 0.3.0 will refuse to start in this configuration.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            logging.warning(f"{LogColors.FAIL}Starting with NO authentication (MESH_AUTH_TOKEN unset). "
+                            f"This becomes an error in MeshSocket 0.3.0.{LogColors.ENDC}")
         if self._on_startup:
             self._on_startup()
         logging.info(f"{LogColors.HEADER}Starting Server on ws://{self.host}:{self.port}{LogColors.ENDC}")

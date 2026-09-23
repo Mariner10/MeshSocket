@@ -3,11 +3,13 @@ import certifi
 import inspect
 import json
 import ssl
+import stat
 import uuid
 import time
 import logging
 import os
 import websockets
+from urllib.parse import urlsplit
 from collections import deque
 from typing import Callable, Dict, Any, List, Optional
 
@@ -172,7 +174,25 @@ class MeshSocket:
         return self._connected_event
 
     def __str__(self):
-        return f"{self.name}, {self.url}"
+        return f"{self.name}, {self.safe_url}"
+
+    @property
+    def safe_url(self) -> Optional[str]:
+        """scheme://host[:port] only — never the path or query, which may carry a
+        token, and which therefore must never reach a log line."""
+        if not self.url:
+            return self.url
+        try:
+            parts = urlsplit(self.url)
+        except ValueError:
+            return "<unparseable url>"
+        if not parts.scheme or not parts.hostname:
+            return "<unparseable url>"
+        host = parts.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme}://{host}{port}"
 
     def on(self, type: str, func: Callable = None):
         if func is None:
@@ -298,7 +318,7 @@ class MeshSocket:
             listen_task = None
             admitted = False
             try:
-                logging.info(f"{LogColors.BLUE}{self.name} connecting to {self.url}...{LogColors.ENDC}")
+                logging.info(f"{LogColors.BLUE}{self.name} connecting to {self.safe_url}...{LogColors.ENDC}")
                 ssl_context = ssl.create_default_context(cafile=certifi.where()) if self.url.startswith("wss://") else None
                 async with websockets.connect(self.url, ssl=ssl_context) as ws:
                     self.connection = ws
@@ -439,18 +459,46 @@ class MeshSocket:
         await loop.run_in_executor(None, self._write_lines_to_file, [packet_str])
 
     def _write_lines_to_file(self, lines: List[str]):
-        with open(self.offline_file_path, "a") as f:
+        # Owner-only from the first byte: the buffer holds frames that are
+        # replayed verbatim onto an authenticated socket.
+        fd = os.open(self.offline_file_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
             for line in lines:
                 f.write(line + "\n")
+        try:
+            os.chmod(self.offline_file_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _valid_buffered_frame(line: str) -> bool:
+        """A replayable line is one JSON object with a string `type` (a frame this
+        client itself produced). Anything else was not written by us."""
+        try:
+            frame = json.loads(line)
+        except (ValueError, TypeError):
+            return False
+        return (isinstance(frame, dict) and isinstance(frame.get("type"), str)
+                and isinstance(frame.get("id"), str)
+                and frame.get("type") not in ("identify", "welcome"))
 
     async def _flush_offline_queue(self):
         if self.offline_file_path and os.path.exists(self.offline_file_path):
             logging.info(f"{LogColors.WARNING}Flushing disk buffer...{LogColors.ENDC}")
             try:
+                dropped = 0
                 with open(self.offline_file_path, "r") as f:
                     for line in f:
-                        if line.strip():
-                            await self.connection.send(line.strip())
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if not self._valid_buffered_frame(line):
+                            dropped += 1
+                            continue
+                        await self.connection.send(line)
+                if dropped:
+                    logging.warning(f"{LogColors.WARNING}Dropped {dropped} invalid line(s) from the "
+                                    f"disk buffer (not frames this client wrote){LogColors.ENDC}")
                 os.remove(self.offline_file_path)
             except Exception as e:
                 logging.error(f"Failed to flush disk buffer: {e}")
