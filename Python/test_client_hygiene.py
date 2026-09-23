@@ -6,29 +6,24 @@ import asyncio
 import json
 import os
 import stat
-import warnings
 
 import pytest
 
+import meshsocket
 from conftest import start_relay, stop_relay
-from socket_server import MeshServer
-from socketCore import MeshSocket
+from socket_server import MeshServer, MeshServerConfigError
+from socketCore import MeshSocket, sanitize_identity, valid_ident
 
 
-# --- deprecation path for anonymous relays -----------------------------------
+# --- fail closed: no token, no start -------------------------------------------
 
 @pytest.mark.asyncio
-async def test_start_without_token_warns(monkeypatch):
+async def test_start_without_token_raises(monkeypatch):
     monkeypatch.delenv("MESH_AUTH_TOKEN", raising=False)
     server = MeshServer(host="127.0.0.1", port=0)
-    with pytest.warns(DeprecationWarning, match="WITHOUT authentication"):
-        task = asyncio.create_task(server.start())
-        await asyncio.wait_for(server.started.wait(), 5)
-    task.cancel()
-    try:
-        await task
-    except (asyncio.CancelledError, Exception):
-        pass
+    with pytest.raises(MeshServerConfigError, match="WITHOUT authentication"):
+        await server.start()
+    assert not server.started.is_set()
 
 
 @pytest.mark.asyncio
@@ -37,21 +32,72 @@ async def test_start_without_token_warns(monkeypatch):
     ({}, "tok"),
     ({"auth_handler": lambda t, ip: True}, None),
 ])
-async def test_start_does_not_warn_when_opted_in_or_authenticated(monkeypatch, kwargs, env):
+async def test_start_succeeds_when_opted_in_or_authenticated(monkeypatch, kwargs, env):
     if env is None:
         monkeypatch.delenv("MESH_AUTH_TOKEN", raising=False)
     else:
         monkeypatch.setenv("MESH_AUTH_TOKEN", env)
     server = MeshServer(host="127.0.0.1", port=0, **kwargs)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        task = asyncio.create_task(server.start())
-        await asyncio.wait_for(server.started.wait(), 5)
+    task = asyncio.create_task(server.start())
+    await asyncio.wait_for(server.started.wait(), 5)
     task.cancel()
     try:
         await task
     except (asyncio.CancelledError, Exception):
         pass
+
+
+def test_default_host_is_loopback(monkeypatch):
+    monkeypatch.delenv("MESH_HOST", raising=False)
+    assert MeshServer().host == "127.0.0.1"
+    monkeypatch.setenv("MESH_HOST", "0.0.0.0")
+    assert MeshServer().host == "0.0.0.0"
+    assert MeshServer(host="192.168.1.5").host == "192.168.1.5"
+
+
+# --- sanitize_identity: a helper for CLIENTS (the relay never sanitizes) --------
+
+@pytest.mark.parametrize("raw, kind, expected", [
+    ("Carter's iPhone", "name", "Carter-s-iPhone"),
+    ("CAR-TER Remote", "name", "CAR-TER-Remote"),
+    ("123.Carter's iPhone", "name", "123.Carter-s-iPhone"),
+    ("phone", "name", "phone"),
+    ("190003614929046.hub", "name", "190003614929046.hub"),
+    ("  --weird__name--  ", "name", "weird__name"),
+    ("_lead", "name", "lead"),
+    ("!!!", "name", "node"),
+    ("!!!", "channel", "default"),
+    ("home lights", "channel", "home-lights"),
+    ("a.b.c", "channel", "a-b-c"),
+    ("x" * 100, "name", "x" * 64),
+    ("\U0001F986 duck", "name", "duck"),
+])
+def test_sanitize_identity(raw, kind, expected):
+    out = sanitize_identity(raw, kind)
+    assert out == expected
+    assert valid_ident(out)
+
+
+@pytest.mark.parametrize("raw", ["", "N" * 900_000, "x" * 257, None, 5, ["a"]])
+def test_sanitize_identity_rejects_non_strings_and_bad_lengths(raw):
+    with pytest.raises(ValueError):
+        sanitize_identity(raw)
+
+
+def test_sanitize_identity_is_exported_from_the_package():
+    assert meshsocket.sanitize_identity is sanitize_identity
+    assert meshsocket.valid_ident is valid_ident
+    assert meshsocket.__version__ == "0.2.0"
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_sanitize_it_closes(relay):
+    from conftest import expect_close
+    ws = await relay.raw()
+    await relay.identify(ws, "Carter's iPhone")
+    await expect_close(ws, 1008)
+    ok, w = await relay.join(sanitize_identity("Carter's iPhone"))
+    assert w["name"] == "Carter-s-iPhone"
 
 
 # --- URL logging ---------------------------------------------------------------

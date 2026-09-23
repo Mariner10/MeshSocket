@@ -16,8 +16,11 @@ RUN groupadd --system --gid 65532 mesh \
 
 WORKDIR /app
 COPY --chown=65532:65532 Python/socketCore.py Python/socket_server.py /app/lib/
+# The relay binds 127.0.0.1 by default (0.2.0); inside a container it must
+# listen on the container's interfaces to be reachable via port mapping.
 ENV PYTHONPATH=/app \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MESH_HOST=0.0.0.0
 
 USER 65532:65532
 EXPOSE 8765

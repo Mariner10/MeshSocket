@@ -1,24 +1,22 @@
 import asyncio
 import hmac
-import re
 import uuid
-import warnings
 import websockets
-from socketCore import MeshSocket, LogColors
+from socketCore import MeshSocket, LogColors, IDENT_RE, NAMESPACED_RE, valid_ident, sanitize_identity
 import logging
 import os
 from typing import Any, Callable, Dict, Optional, Set
 
-# Identity grammar shared with the carter-relay gateway. Raw client names and
-# channels are plain identifiers; the gateway emits `<account digits>.<ident>`.
-# Anything else is closed with 1008 — names are echoed into every roster push,
-# the welcome frame and the logs, so they must be short and printable.
-IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-NAMESPACED_RE = re.compile(r"^[0-9]{1,32}\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# Identity grammar (IDENT_RE / NAMESPACED_RE / valid_ident live in socketCore so
+# clients can import them as `meshsocket.valid_ident` / `meshsocket.sanitize_identity`).
+# Raw client names and channels are plain identifiers; the carter-relay gateway
+# emits `<account digits>.<ident>`. Anything else is closed with 1008 — the
+# server does NOT sanitize; names are echoed into every roster push, the welcome
+# frame and the logs, so they must be short and printable.
 
 
-def valid_ident(value: Any) -> bool:
-    return isinstance(value, str) and bool(IDENT_RE.match(value) or NAMESPACED_RE.match(value))
+class MeshServerConfigError(RuntimeError):
+    """The server refused to start because its configuration is unsafe."""
 
 
 def _env_int(name: str, default: int) -> int:
@@ -49,7 +47,7 @@ class MeshServer:
     AUTH_TIMEOUT = 5.0
 
     def __init__(self,
-                 host: str = "0.0.0.0",
+                 host: Optional[str] = None,
                  port: int = 8765,
                  rate_limit: Optional[int] = None,
                  max_size: Optional[int] = None,
@@ -62,11 +60,13 @@ class MeshServer:
                  ping_interval: Optional[float] = 20.0,
                  ping_timeout: Optional[float] = 20.0,
                  allow_anonymous: bool = False):
-        self.host = host
+        # Loopback by default (0.2.0). Serve a LAN or a container network by
+        # passing host="0.0.0.0" or setting MESH_HOST.
+        self.host = host if host is not None else (os.getenv("MESH_HOST") or "127.0.0.1")
         self.port = port
-        # Explicit opt-in for running without any token. 0.2.0 warns when the
-        # default auth handler has no MESH_AUTH_TOKEN and this is False;
-        # 0.3.0 will refuse to start (see CHANGELOG).
+        # Explicit opt-in for running without any token. start() raises
+        # MeshServerConfigError when the default auth handler has no
+        # MESH_AUTH_TOKEN and this is False.
         self.allow_anonymous = allow_anonymous
         # Limits: constructor argument, else MESH_* environment knob, else default.
         #   MESH_RATE_LIMIT          inbound frames per second per connection (50)
@@ -191,16 +191,15 @@ class MeshServer:
 
     async def start(self):
         if self._auth_is_open() and not self.allow_anonymous:
-            warnings.warn(
-                "MeshServer is starting WITHOUT authentication: MESH_AUTH_TOKEN is unset and no "
-                "auth_handler was given. Every socket that can reach this port is admitted. Set "
-                "MESH_AUTH_TOKEN, pass auth_handler=, or pass allow_anonymous=True to opt in "
-                "explicitly. MeshSocket 0.3.0 will refuse to start in this configuration.",
-                DeprecationWarning,
-                stacklevel=2,
+            raise MeshServerConfigError(
+                "MeshServer refuses to start WITHOUT authentication: MESH_AUTH_TOKEN is unset and no "
+                "auth_handler was given, so every socket that could reach this port would be admitted. "
+                "Set MESH_AUTH_TOKEN, pass auth_handler=, or pass allow_anonymous=True to opt in "
+                "explicitly (loopback-only development relays, for example)."
             )
-            logging.warning(f"{LogColors.FAIL}Starting with NO authentication (MESH_AUTH_TOKEN unset). "
-                            f"This becomes an error in MeshSocket 0.3.0.{LogColors.ENDC}")
+        if self.allow_anonymous and self._auth_is_open():
+            logging.warning(f"{LogColors.WARNING}Starting with NO authentication "
+                            f"(allow_anonymous=True){LogColors.ENDC}")
         if self._on_startup:
             self._on_startup()
         logging.info(f"{LogColors.HEADER}Starting Server on ws://{self.host}:{self.port}{LogColors.ENDC}")

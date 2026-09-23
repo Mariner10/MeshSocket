@@ -8,10 +8,50 @@ import uuid
 import time
 import logging
 import os
+import re
 import websockets
 from urllib.parse import urlsplit
 from collections import deque
 from typing import Callable, Dict, Any, List, Optional
+
+# Identity grammar enforced by the relay (see socket_server): a plain identifier,
+# or the carter-relay gateway's `<account digits>.<identifier>` form.
+IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+NAMESPACED_RE = re.compile(r"^[0-9]{1,32}\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_NS_PREFIX_RE = re.compile(r"^([0-9]{1,32})\.(.*)$", re.S)
+
+
+def valid_ident(value: Any) -> bool:
+    return isinstance(value, str) and bool(IDENT_RE.match(value) or NAMESPACED_RE.match(value))
+
+
+def sanitize_identity(value: Any, kind: str = "name") -> str:
+    """Turn a free-form string into a name/channel the relay accepts.
+
+    The relay itself does NOT sanitize: an identify whose name or channel fails
+    the grammar is closed with 1008. Clients call this before identifying (for
+    example on a device name such as "Carter's iPhone" -> "Carter-s-iPhone").
+
+    Rule (identical in relay, gateway and app): `value` must be a str of 1..256
+    chars, else ValueError. A leading `<digits>.` namespace prefix is kept and
+    only the remainder is sanitized. Every char outside [A-Za-z0-9_-] becomes
+    "-", runs of "-" collapse to one, leading/trailing "-" (and a leading "_",
+    which the grammar forbids) are stripped, the result is truncated to 64 chars,
+    and an empty result becomes "node" (kind="name") or "default"
+    (kind="channel"). The output always satisfies `valid_ident`.
+    """
+    if not isinstance(value, str) or not 1 <= len(value) <= 256:
+        raise ValueError(f"{kind} must be a string of 1..256 characters")
+    prefix = ""
+    m = _NS_PREFIX_RE.match(value)
+    if m:
+        prefix, value = m.group(1) + ".", m.group(2)
+    out = re.sub(r"[^A-Za-z0-9_-]", "-", value)
+    out = re.sub(r"-{2,}", "-", out).strip("-").lstrip("_")
+    out = out[:64].rstrip("-")
+    if not out:
+        out = "node" if kind == "name" else "default"
+    return prefix + out
 
 # ANSI Colors for nicer logs
 class LogColors:

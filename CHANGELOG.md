@@ -6,8 +6,9 @@ relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 ## Unreleased (0.2.0)
 
 Hardening release driven by the 2026-09-22 security review of the CAR-TER stack.
-Well-behaved clients (identify once, valid names, no forged `welcome`) keep working
-unchanged; only misbehaving frames are now closed.
+Clean slate: no compatibility shims for 0.1.x behavior. Clients that identify once
+with a valid name and never forge `welcome` keep working; everything else is closed,
+and a relay without a token no longer starts.
 
 ### Breaking / behavior changes (relay)
 
@@ -35,9 +36,13 @@ unchanged; only misbehaving frames are now closed.
   (previously prefix matching, which let `http://localhost.evil.com` through).
 - Defaults tightened: `max_size` 256 KiB (was 1 MiB), `rate_limit` 50 frames/s per
   connection (was unlimited), explicit `ping_interval=20`/`ping_timeout=20`.
-- **Deprecation:** `MeshServer.start()` emits a `DeprecationWarning` (and a WARNING
-  log line) when it starts with the default auth handler and no `MESH_AUTH_TOKEN`,
-  unless constructed with `allow_anonymous=True`. See "Planned for 0.3.0".
+- **Fail closed.** `MeshServer.start()` raises `MeshServerConfigError` when it would
+  run with the default auth handler and no `MESH_AUTH_TOKEN`, unless constructed with
+  `allow_anonymous=True` (which logs a WARNING). Set the token, pass `auth_handler=`,
+  or opt in explicitly.
+- **Loopback by default.** `MeshServer()` binds `127.0.0.1` (was `0.0.0.0`). Pass
+  `host="0.0.0.0"` or set `MESH_HOST` to serve a LAN or a container network; the shipped
+  `Dockerfile.python` sets `MESH_HOST=0.0.0.0`.
 
 ### Fixed (relay)
 
@@ -69,6 +74,12 @@ unchanged; only misbehaving frames are now closed.
 - `MeshSocket.authorize` pre-dispatch hook, `MeshSocket.freeze_id()`,
   `MeshSocket.safe_url`, `MeshSocket.MAX_INFLIGHT` (64 concurrent inbound handlers
   per connection).
+- `meshsocket.sanitize_identity(value, kind)` and `meshsocket.valid_ident(value)`:
+  the identity grammar as importable helpers. The relay does not sanitize (it closes
+  1008); clients call `sanitize_identity` before identifying, e.g.
+  `"Carter's iPhone" -> "Carter-s-iPhone"`, `"123.Carter's iPhone" -> "123.Carter-s-iPhone"`.
+  Same rule for the gateway and the app.
+- `MESH_HOST` env knob for the bind address.
 - Swift: `pingInterval`/`pongTimeout` keepalive with `pauseKeepalive()` /
   `resumeKeepalive()`; `init(validating:)` throwing initializer for bad URLs; one
   `URLSession` per socket.
@@ -93,13 +104,13 @@ unchanged; only misbehaving frames are now closed.
 - `publish.yml`: SHA-pinned actions, `environment: pypi`, pytest job gating the
   build/publish.
 
-### Planned for 0.3.0
+### Upgrading a relay from 0.1.x
 
-- `MeshServer.start()` **raises** when no token is configured and
-  `allow_anonymous` is not `True`.
-- Default bind host becomes `127.0.0.1` (was `0.0.0.0`); pass `host="0.0.0.0"`
-  explicitly to serve a LAN.
-- Default `rate_limit`/`max_size` remain as in 0.2.0.
+1. Set `MESH_AUTH_TOKEN` (or pass `auth_handler=`); the server no longer starts open.
+2. If the relay must be reachable off-box, set `MESH_HOST=0.0.0.0` (containers: the
+   shipped Dockerfile does this).
+3. Make sure every client's `name`/`channel` matches the grammar; run device names
+   through `meshsocket.sanitize_identity` first.
 
 ## 0.1.2
 

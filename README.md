@@ -85,16 +85,16 @@ pip install websockets certifi
 MESH_AUTH_TOKEN=your-token python Python/socket_server.py
 ```
 
-The server listens on `0.0.0.0:8765` by default. Starting **without** `MESH_AUTH_TOKEN`
-admits every socket that can reach the port; since 0.2.0 that emits a `DeprecationWarning`
-unless you construct `MeshServer(allow_anonymous=True)`, and 0.3.0 will refuse to start
-(and bind `127.0.0.1` by default).
+Since 0.2.0 the server listens on `127.0.0.1:8765` by default (set `MESH_HOST=0.0.0.0` or
+pass `host=` to serve a LAN) and **refuses to start without** `MESH_AUTH_TOKEN` unless you
+construct `MeshServer(allow_anonymous=True)` explicitly.
 
 Limits and knobs (environment variable, default):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MESH_AUTH_TOKEN` | unset | Shared token clients must present in `identify` (constant-time compare) |
+| `MESH_HOST` | `127.0.0.1` | Bind address |
+| `MESH_AUTH_TOKEN` | unset | Shared token clients must present in `identify` (constant-time compare); required unless `allow_anonymous=True` |
 | `MESH_ALLOWED_ORIGINS` | `http://127.0.0.1,http://localhost` | Exact scheme+host+port match for browser `Origin` headers |
 | `MESH_MAX_CONNECTIONS` | `2000` | Open sockets, identified or not (4429 beyond) |
 | `MESH_MAX_PENDING_PER_IP` | `10` | Sockets per client IP that have not finished `identify` |
@@ -103,7 +103,9 @@ Limits and knobs (environment variable, default):
 | `MESH_TRUSTED_PROXIES` | empty | Comma list of proxy IPs whose `X-Forwarded-For` / `X-Real-IP` are believed |
 
 Client `name` and `channel` must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (or the
-gateway's `<digits>.<ident>` form); anything else is closed with 1008. `identify` is
+gateway's `<digits>.<ident>` form); anything else is closed with 1008 (the relay never
+rewrites names). Clients can normalise free-form names first with
+`meshsocket.sanitize_identity("Carter's iPhone")` → `Carter-s-iPhone`. `identify` is
 accepted once per connection. See `CHANGELOG.md` for the full 0.2.0 behavior list.
 
 ## Testing
