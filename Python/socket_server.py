@@ -158,6 +158,17 @@ class MeshServer:
 
             authenticated: asyncio.Future = asyncio.get_running_loop().create_future()
 
+            def _admitted() -> bool:
+                return (authenticated.done() and not authenticated.cancelled()
+                        and authenticated.result() is True)
+
+            # Pre-dispatch gate: until identify has succeeded, `identify` is the
+            # ONLY frame type this socket can get processed (no ping, no
+            # node_status, no replies). Replaces the per-handler capability
+            # checks as the thing standing between an unidentified socket and
+            # the mesh.
+            client.authorize = lambda msg_type: msg_type == "identify" or _admitted()
+
             @client.on('identify')
             async def handle_identify(payload):
                 # identify is a one-shot. A second identify (valid token or not)
@@ -286,6 +297,8 @@ class MeshServer:
 
             @client.on("node_status")
             async def on_node_status(payload):
+                if not client.can_broadcast:
+                    return {"error": "broadcast not allowed", "status": "failed"}
                 await self.broadcast("node_status", payload, sender=client)
                 return {"status": "broadcasted"}
 
@@ -331,6 +344,11 @@ class MeshServer:
                     return {"error": "Target not found", "status": "failed"}
 
             listen_task = asyncio.create_task(client.listen())
+            # A socket that closes before identifying must not hold its slot
+            # (and the handler) open for the rest of the auth window.
+            listen_task.add_done_callback(
+                lambda _t: authenticated.done() or authenticated.set_result(False)
+            )
 
             try:
                 is_auth = await asyncio.wait_for(authenticated, timeout=5.0)
@@ -379,25 +397,55 @@ class MeshServer:
         finally:
             _pending_conns[remote_ip] = max(0, _pending_conns.get(remote_ip, 1) - 1)
 
+    # Per-peer send budget for fan-outs. A peer that cannot take a frame within
+    # this window is stalled or gone; it is reaped so it cannot hold up the
+    # roster or a channel broadcast for everyone else.
+    SEND_TIMEOUT = 2.0
+
+    async def _fan_out(self, sends, targets, what: str):
+        """Send to every target concurrently; reap any that fail or stall."""
+        if not sends:
+            return
+        results = await asyncio.gather(
+            *(asyncio.wait_for(s, self.SEND_TIMEOUT) for s in sends),
+            return_exceptions=True,
+        )
+        for peer, result in zip(targets, results):
+            if isinstance(result, BaseException):
+                self._reap(peer, f"{what} send failed: {type(result).__name__}")
+
+    def _reap(self, peer: MeshSocket, reason: str):
+        """Drop a dead/stalled peer from the tables now and close it out of band."""
+        logging.warning(f"{LogColors.WARNING}Reaping '{peer.name}' — {reason}{LogColors.ENDC}")
+        if self.clients.get(peer.id) is peer:
+            self.clients.pop(peer.id, None)
+        if self.clients_by_name.get(peer.name) is peer:
+            self.clients_by_name.pop(peer.name, None)
+        asyncio.create_task(peer.stop(reason=reason))
+
     async def _broadcast_client_list(self):
-        for client in self.clients.values():
+        sends, targets = [], []
+        for client in list(self.clients.values()):
             if not getattr(client, "can_monitor", False):
                 continue
             if getattr(client, "broadcast_scope", "channel") == "global":
                 visible_clients = [self._client_summary(peer) for peer in self.clients.values()]
             else:
                 visible_clients = [self._client_summary(peer) for peer in self.clients.values() if self._same_channel(client, peer)]
-            await client.send('server_client_list', {'clients': visible_clients})
+            sends.append(client.send('server_client_list', {'clients': visible_clients}))
+            targets.append(client)
+        await self._fan_out(sends, targets, "roster")
 
     async def broadcast(self, type: str, payload: dict, sender: MeshSocket | None = None):
         if not self.clients:
             return
-        tasks = []
-        for peer in self.clients.values():
+        sends, targets = [], []
+        for peer in list(self.clients.values()):
             if sender and not self._can_receive_broadcast(sender, peer):
                 continue
-            tasks.append(peer.send(type, payload))
-        await asyncio.gather(*tasks, return_exceptions=True)
+            sends.append(peer.send(type, payload))
+            targets.append(peer)
+        await self._fan_out(sends, targets, "broadcast")
 
 
 if __name__ == "__main__":

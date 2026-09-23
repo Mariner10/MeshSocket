@@ -112,3 +112,80 @@ async def test_joiner_is_in_its_own_roster_push(relay):
     roster = await recv_type(monitor, "server_client_list")
     names = {c["name"] for c in roster["payload"]["clients"]}
     assert "joiner" in names
+
+
+# --- WP1.2: pre-auth gate, node_status capability, resilient fan-out -----------
+
+@pytest.mark.asyncio
+async def test_unidentified_node_status_is_not_delivered(relay):
+    listener, _ = await relay.join("listener")
+    stranger = await relay.raw()
+    await stranger.send(_frame("node_status", {"evil": 1}))
+    with pytest.raises(asyncio.TimeoutError):
+        await recv_type(listener, "node_status", timeout=0.8)
+
+
+@pytest.mark.asyncio
+async def test_unidentified_status_request_and_ping_are_not_answered(relay):
+    stranger = await relay.raw()
+    await stranger.send(_frame("status_request"))
+    await stranger.send(_frame("ping"))
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(stranger.recv(), 0.8)
+
+
+@pytest.mark.asyncio
+async def test_node_status_requires_can_broadcast(relay):
+    listener, _ = await relay.join("listener2", channel="ns")
+    muted, _ = await relay.join("muted", channel="ns", can_broadcast=False)
+    await muted.send(_frame("node_status", {"x": 1}, msg_id="q1"))
+    reply = await recv_type(muted, "node_status")
+    assert reply["reply_to"] == "q1"
+    assert reply["payload"]["status"] == "failed"
+    with pytest.raises(asyncio.TimeoutError):
+        await recv_type(listener, "node_status", timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_dead_monitor_does_not_stop_roster_delivery(relay):
+    live, _ = await relay.join("live-mon", channel="rr", can_monitor=True)
+    await recv_type(live, "server_client_list")
+    dead, wd = await relay.join("dead-mon", channel="rr", can_monitor=True)
+    await recv_type(live, "server_client_list")
+    await recv_type(dead, "server_client_list")
+
+    # Make the dead monitor's server-side send blow up the way a half-open
+    # socket does (ConnectionError out of MeshSocket.send).
+    server_dead = relay.server.clients[wd["id"]]
+
+    async def boom(*a, **k):
+        raise ConnectionError("half-open")
+    server_dead.send = boom
+
+    _, wj = await relay.join("joiner2", channel="rr")
+    roster = await recv_type(live, "server_client_list", timeout=3)
+    assert "joiner2" in {c["name"] for c in roster["payload"]["clients"]}
+    await asyncio.sleep(0.3)
+    assert wd["id"] not in relay.server.clients, "the dead monitor must be reaped"
+    assert wj["id"] in relay.server.clients
+
+
+@pytest.mark.asyncio
+async def test_stalled_peer_does_not_block_broadcast(relay):
+    relay.server.SEND_TIMEOUT = 0.3
+    sender, _ = await relay.join("bsender", channel="bb")
+    fast, _ = await relay.join("bfast", channel="bb")
+    slow, ws_ = await relay.join("bslow", channel="bb")
+    server_slow = relay.server.clients[ws_["id"]]
+
+    async def hang(*a, **k):
+        await asyncio.sleep(10)
+    server_slow.send = hang
+
+    await sender.send(_frame("broadcast_request", {"msg": "hi"}, msg_id="b1"))
+    got = await recv_type(fast, "broadcast", timeout=1.5)
+    assert got["payload"] == {"msg": "hi"}
+    ack = await recv_type(sender, "broadcast_request", timeout=1.5)
+    assert ack["payload"] == {"status": "sent"}
+    await asyncio.sleep(0.2)
+    assert ws_["id"] not in relay.server.clients, "the stalled peer must be reaped"

@@ -499,10 +499,17 @@ class MeshSocket:
                 pass
 
     async def _process_packet(self, packet: dict):
+        if not isinstance(packet, dict):
+            return
         msg_id = packet.get('id')
         msg_type = packet.get('type')
         payload = packet.get('payload')
         reply_to = packet.get('reply_to')
+        # Single pre-dispatch gate (server installs it per connection): nothing
+        # — not replies, not `ping`, not `node_status` — is processed for a
+        # socket the gate has not admitted.
+        if self.authorize is not None and not self.authorize(msg_type):
+            return
         if reply_to and reply_to in self._pending_requests:
             future = self._pending_requests.pop(reply_to)
             if not future.done(): future.set_result(payload)
