@@ -15,6 +15,9 @@ relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
   unparsed when deeper than `maxFrameDepth` (new `init` parameter, default
   `MeshSocket.defaultMaxFrameDepth` = 128). `MeshSocket.jsonDepth(of:limit:)` is
   public for apps that parse peer bytes themselves.
+  The scan reads UTF-8, so frames with any NUL byte or a UTF-16 BOM (UTF-16/32
+  text, which `JSONSerialization` also accepts and where a code unit such as
+  U+0122 carries a fake `"` byte) count as too deep and are dropped.
 - **Python: a frame deeper than `json.loads`'s recursion limit is dropped.** The
   `RecursionError` it raises escaped the listen loop and dropped the connection
   (a peer could force endless reconnects); it is now ignored like any bad frame.

@@ -483,7 +483,17 @@ public actor MeshSocket {
     /// is 2. Brackets inside strings (escaped quotes included) don't count;
     /// malformed text is left for the parser to refuse. Stops as soon as the
     /// depth passes `limit` (returns `limit + 1`), so a hostile frame costs little.
+    ///
+    /// The scan reads UTF-8 only. `JSONSerialization` also accepts UTF-16/32,
+    /// where a non-ASCII code unit can carry a fake `"` byte (U+0122 in UTF-16LE
+    /// is `22 01`) and hide real nesting, so any NUL byte (never valid in UTF-8
+    /// JSON, present in every UTF-16/32 JSON text) or a UTF-16 BOM counts as
+    /// over the limit.
     public static func jsonDepth(of data: Data, limit: Int = .max) -> Int {
+        let overLimit = limit == .max ? limit : limit + 1
+        if data.starts(with: [0xFE, 0xFF]) || data.starts(with: [0xFF, 0xFE]) || data.contains(0) {
+            return overLimit
+        }
         var deepest = 0, level = 0
         var inString = false, escaped = false
         for byte in data {
