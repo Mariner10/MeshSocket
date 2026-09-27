@@ -532,7 +532,7 @@ class MeshSocket:
         client itself produced). Anything else was not written by us."""
         try:
             frame = json.loads(line)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return False
         return (isinstance(frame, dict) and isinstance(frame.get("type"), str)
                 and isinstance(frame.get("id"), str)
@@ -620,7 +620,10 @@ class MeshSocket:
 
             try:
                 data = json.loads(message)
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+                # RecursionError: a frame nested deeper than the parser's C
+                # recursion limit. Drop it like any bad frame instead of letting
+                # it escape and tear the connection down (peer-forced reconnects).
                 continue
             await inflight.acquire()
             asyncio.create_task(run(data))

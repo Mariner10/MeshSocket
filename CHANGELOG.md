@@ -3,7 +3,23 @@
 All notable changes to MeshSocket (the Python `meshsocket` package, the Python
 relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 
-## Unreleased (0.2.0)
+## Unreleased
+
+### Security
+
+- **Swift: deeply nested frames no longer crash the receive task.**
+  `JSONSerialization` recurses per nesting level and overflowed the 512 KB stack
+  of a Swift-concurrency thread on objects nested ~400-511 deep, so any channel
+  peer could SIGBUS a client with one frame. Every inbound frame is now measured
+  with an iterative raw-byte bracket scan (strings and escapes skipped) and dropped
+  unparsed when deeper than `maxFrameDepth` (new `init` parameter, default
+  `MeshSocket.defaultMaxFrameDepth` = 128). `MeshSocket.jsonDepth(of:limit:)` is
+  public for apps that parse peer bytes themselves.
+- **Python: a frame deeper than `json.loads`'s recursion limit is dropped.** The
+  `RecursionError` it raises escaped the listen loop and dropped the connection
+  (a peer could force endless reconnects); it is now ignored like any bad frame.
+
+## 0.2.0
 
 Hardening release driven by the 2026-09-22 security review of the CAR-TER stack.
 Clean slate: no compatibility shims for 0.1.x behavior. Clients that identify once

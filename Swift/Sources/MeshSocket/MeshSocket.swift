@@ -42,6 +42,13 @@ public actor MeshSocket {
     public let pingInterval: TimeInterval
     public let pongTimeout: TimeInterval
     private var keepaliveTask: Task<Void, Never>?
+
+    /// Inbound frames nested deeper than this (objects + arrays) are dropped
+    /// unparsed. `JSONSerialization` recurses per level and overflows the 512 KB
+    /// stack of a Swift-concurrency thread on objects nested ~400-511 deep, so a
+    /// single hostile frame from any channel peer could crash the process.
+    public nonisolated let maxFrameDepth: Int
+    public static let defaultMaxFrameDepth = 128
     private var keepalivePaused = false
 
     var handlers: [String: @Sendable (Any?) async -> Any?] = [:]
@@ -78,7 +85,8 @@ public actor MeshSocket {
         onReconnect: (@Sendable () async -> Void)? = nil,
         onDisconnect: (@Sendable () async -> Void)? = nil,
         pingInterval: TimeInterval = 30,
-        pongTimeout: TimeInterval = 10
+        pongTimeout: TimeInterval = 10,
+        maxFrameDepth: Int = MeshSocket.defaultMaxFrameDepth
     ) {
         // Kept non-failable for source compatibility; callers that cannot
         // pre-validate the URL should use `init(validating:)` instead.
@@ -91,7 +99,7 @@ public actor MeshSocket {
                   broadcastScope: broadcastScope, maxOfflineBuffer: maxOfflineBuffer,
                   offlineFilePath: offlineFilePath, onReconnect: onReconnect,
                   onDisconnect: onDisconnect, pingInterval: pingInterval, pongTimeout: pongTimeout,
-                  transportFactory: MeshTransports.urlSession)
+                  maxFrameDepth: maxFrameDepth, transportFactory: MeshTransports.urlSession)
     }
 
     /// Throwing variant: `MeshSocketError.invalidURL` instead of a crash on a bad URL.
@@ -112,7 +120,8 @@ public actor MeshSocket {
         onReconnect: (@Sendable () async -> Void)? = nil,
         onDisconnect: (@Sendable () async -> Void)? = nil,
         pingInterval: TimeInterval = 30,
-        pongTimeout: TimeInterval = 10
+        pongTimeout: TimeInterval = 10,
+        maxFrameDepth: Int = MeshSocket.defaultMaxFrameDepth
     ) throws {
         guard let parsed = URL(string: url), let scheme = parsed.scheme?.lowercased(),
               ["ws", "wss"].contains(scheme), parsed.host != nil else {
@@ -124,7 +133,7 @@ public actor MeshSocket {
                   broadcastScope: broadcastScope, maxOfflineBuffer: maxOfflineBuffer,
                   offlineFilePath: offlineFilePath, onReconnect: onReconnect,
                   onDisconnect: onDisconnect, pingInterval: pingInterval, pongTimeout: pongTimeout,
-                  transportFactory: MeshTransports.urlSession)
+                  maxFrameDepth: maxFrameDepth, transportFactory: MeshTransports.urlSession)
     }
 
     /// Designated initializer. `transportFactory` is how tests inject a fake socket.
@@ -146,12 +155,14 @@ public actor MeshSocket {
         onDisconnect: (@Sendable () async -> Void)?,
         pingInterval: TimeInterval,
         pongTimeout: TimeInterval,
+        maxFrameDepth: Int = MeshSocket.defaultMaxFrameDepth,
         transportFactory: @escaping MeshTransportFactory
     ) {
         self.url = parsedURL
         self.name = name
         self.pingInterval = pingInterval
         self.pongTimeout = pongTimeout
+        self.maxFrameDepth = maxFrameDepth
         self.session = URLSession(configuration: .default)
         self.transportFactory = transportFactory
         self.id = UUID().uuidString
@@ -441,12 +452,12 @@ public actor MeshSocket {
                 switch message {
                 case .string(let text):
                     guard let data = text.data(using: .utf8),
-                          let packet = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                          let packet = Self.decodeFrame(data, maxDepth: maxFrameDepth) else {
                         continue
                     }
                     Task { [weak self] in await self?.processPacket(packet) }
                 case .data(let data):
-                    guard let packet = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    guard let packet = Self.decodeFrame(data, maxDepth: maxFrameDepth) else {
                         continue
                     }
                     Task { [weak self] in await self?.processPacket(packet) }
@@ -457,6 +468,47 @@ public actor MeshSocket {
                 break
             }
         }
+    }
+
+    /// Parses one inbound frame into a packet, or nil when it is malformed, not
+    /// an object, or nested deeper than `maxDepth` (dropped like any bad frame).
+    /// The depth is measured on the raw bytes first, without recursion, so the
+    /// parser never sees a frame deep enough to overflow the stack.
+    static func decodeFrame(_ data: Data, maxDepth: Int) -> [String: Any]? {
+        guard jsonDepth(of: data, limit: maxDepth) <= maxDepth else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    /// Bracket nesting of raw JSON text: scalars are 0, `[]`/`{}` are 1, `[[1]]`
+    /// is 2. Brackets inside strings (escaped quotes included) don't count;
+    /// malformed text is left for the parser to refuse. Stops as soon as the
+    /// depth passes `limit` (returns `limit + 1`), so a hostile frame costs little.
+    public static func jsonDepth(of data: Data, limit: Int = .max) -> Int {
+        var deepest = 0, level = 0
+        var inString = false, escaped = false
+        for byte in data {
+            if inString {
+                if escaped { escaped = false }
+                else if byte == UInt8(ascii: "\\") { escaped = true }
+                else if byte == UInt8(ascii: "\"") { inString = false }
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "\""):
+                inString = true
+            case UInt8(ascii: "["), UInt8(ascii: "{"):
+                level += 1
+                if level > deepest {
+                    deepest = level
+                    if deepest > limit { return deepest }
+                }
+            case UInt8(ascii: "]"), UInt8(ascii: "}"):
+                level -= 1
+            default:
+                break
+            }
+        }
+        return deepest
     }
 
     func processPacket(_ packet: [String: Any]) async {

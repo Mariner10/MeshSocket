@@ -338,3 +338,26 @@ async def test_inbound_handlers_are_bounded_by_semaphore():
     assert done == n
     assert peak <= MeshSocket.MAX_INFLIGHT
     assert peak > 1
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_frame_is_dropped_not_fatal():
+    # Deep enough to raise RecursionError in json.loads on every supported
+    # Python; the loop must drop it and keep processing later frames.
+    depth = 200_000
+    deep = "[" * depth + "]" * depth
+    conn = _ScriptedConnection([deep, _frame("after", 1)])
+    node = MeshSocket(connection=conn, name="deep")
+    seen = []
+
+    async def after(payload):
+        seen.append(payload)
+        return None
+
+    node.on("after", after)
+    await node._listen_loop()
+    for _ in range(50):
+        if seen:
+            break
+        await asyncio.sleep(0.02)
+    assert seen == [1]
