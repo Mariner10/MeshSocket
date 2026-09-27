@@ -3,9 +3,14 @@
 All notable changes to MeshSocket (the Python `meshsocket` package, the Python
 relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 
-## Unreleased
+## 0.3.0 (2026-09-27)
 
 ### Security
+
+Deep-JSON parse crash: frames nested ~400–511 levels (and UTF-16/32 NUL/BOM
+variants) crashed the Swift receive task; frames deeper than `maxFrameDepth`
+(default 128) are now dropped before parsing. Python: `RecursionError` on deep
+frames no longer tears down the connection. Details:
 
 - **Swift: deeply nested frames no longer crash the receive task.**
   `JSONSerialization` recurses per nesting level and overflowed the 512 KB stack
@@ -21,6 +26,12 @@ relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 - **Python: a frame deeper than `json.loads`'s recursion limit is dropped.** The
   `RecursionError` it raises escaped the listen loop and dropped the connection
   (a peer could force endless reconnects); it is now ignored like any bad frame.
+
+### Added (Swift)
+
+- `maxFrameDepth` init parameter, `MeshSocket.defaultMaxFrameDepth`, and
+  `MeshSocket.jsonDepth(of:limit:)`. Minor bump for the new public API; existing
+  call sites compile unchanged.
 
 ## 0.2.0
 
