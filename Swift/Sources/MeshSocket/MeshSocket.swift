@@ -64,6 +64,19 @@ public actor MeshSocket {
     // we start awaiting it (the receive loop runs concurrently), so it can't be lost.
     private var admitContinuation: CheckedContinuation<Bool, Never>?
     private var admittedFlag = false
+    // Each connection attempt gets its own generation. The admission timeout and
+    // the listen task's close hook carry the generation they were armed for, so a
+    // stale one from an earlier attempt can never fail a later attempt's wait.
+    private var admissionGeneration: UInt64 = 0
+    private var admissionTimeoutTask: Task<Void, Never>?
+    /// How long an attempt waits for `welcome` before giving up.
+    var admissionTimeout: TimeInterval = 5.0
+
+    // Inbound frames for a handler run strictly in arrival order per message
+    // type: each run waits for the previous one of the same type. Different types
+    // still run concurrently, so a handler parked on user input (an approval
+    // sheet) never stalls unrelated traffic.
+    private var handlerTails: [String: Task<Void, Never>] = [:]
 
     private var connectionTask: Task<Void, Never>?
     private var listenTask: Task<Void, Never>?
@@ -356,6 +369,7 @@ public actor MeshSocket {
 
                 transport = ws
                 resetAdmission()
+                let generation = admissionGeneration
 
                 // Send identify directly: the socket is open but not yet admitted,
                 // so `_isConnected` is still false and the buffered `send()` path
@@ -369,12 +383,12 @@ public actor MeshSocket {
                 // observed. A close before admission resolves the wait negatively.
                 let started = Task { [weak self] in
                     await self?.listenLoop(ws: ws)
-                    await self?.failAdmission()
+                    await self?.failAdmission(generation: generation)
                 }
                 loop = started
                 listenTask = started
 
-                guard await awaitAdmission() else {
+                guard await awaitAdmission(generation: generation) else {
                     // Never admitted (identify rejected / closed / timed out). Surface
                     // it as a failed attempt and retry with backoff instead of
                     // silently reporting the connection as up. Wake any waiters so a
@@ -455,12 +469,14 @@ public actor MeshSocket {
                           let packet = Self.decodeFrame(data, maxDepth: maxFrameDepth) else {
                         continue
                     }
-                    Task { [weak self] in await self?.processPacket(packet) }
+                    // Routed inline, in arrival order (replies and `welcome` settle
+                    // here before the next frame is read; handlers are queued FIFO).
+                    dispatch(packet)
                 case .data(let data):
                     guard let packet = Self.decodeFrame(data, maxDepth: maxFrameDepth) else {
                         continue
                     }
-                    Task { [weak self] in await self?.processPacket(packet) }
+                    dispatch(packet)
                 @unknown default:
                     continue
                 }
@@ -521,7 +537,17 @@ public actor MeshSocket {
         return deepest
     }
 
+    /// Route one inbound frame and wait for its handler (if any) to finish.
     func processPacket(_ packet: [String: Any]) async {
+        await dispatch(packet)?.value
+    }
+
+    /// Route one inbound frame synchronously on the actor: a reply resumes its
+    /// request and `welcome` settles admission right here, so neither can be
+    /// reordered behind later frames. A request/event is queued behind the
+    /// previous frame of the same type and its run is returned.
+    @discardableResult
+    private func dispatch(_ packet: [String: Any]) -> Task<Void, Never>? {
         let msgID = packet["id"] as? String
         let msgType = packet["type"] as? String
         let payload = packet["payload"]
@@ -534,7 +560,7 @@ public actor MeshSocket {
             if let continuation = pendingRequests.removeValue(forKey: replyTo) {
                 continuation.resume(returning: payload)
             }
-            return
+            return nil
         }
 
         if msgType == "welcome" {
@@ -543,15 +569,21 @@ public actor MeshSocket {
                 self.id = serverID
             }
             noteWelcome()
-            return
+            return nil
         }
 
-        guard let msgType, let handler = handlers[msgType] else { return }
+        guard let msgType, let handler = handlers[msgType] else { return nil }
 
-        let response = await handler(payload)
-        if let response, let msgID {
-            _ = try? await send(msgType, payload: response, replyTo: msgID)
+        let previous = handlerTails[msgType]
+        let run = Task { [weak self] in
+            await previous?.value
+            let response = await handler(payload)
+            if let self, let response, let msgID {
+                _ = try? await self.send(msgType, payload: response, replyTo: msgID)
+            }
         }
+        handlerTails[msgType] = run
+        return run
     }
 
     // MARK: - Keepalive
@@ -633,17 +665,30 @@ public actor MeshSocket {
 
     // MARK: - Admission (welcome) Gate
 
+    /// Tests shorten the welcome wait; production keeps the 5 s default.
+    func setAdmissionTimeoutForTesting(_ seconds: TimeInterval) {
+        admissionTimeout = seconds
+    }
+
     /// Arm the gate for a fresh connection attempt. Called before `identify` is
     /// sent so a `welcome` delivered by the concurrently-running receive loop is
     /// latched rather than dropped.
     private func resetAdmission() {
+        admissionGeneration &+= 1
+        admissionTimeoutTask?.cancel()
+        admissionTimeoutTask = nil
         admittedFlag = false
-        admitContinuation = nil
+        if let stale = admitContinuation {
+            admitContinuation = nil
+            stale.resume(returning: false)
+        }
     }
 
     /// The server admitted us (`welcome` received).
     private func noteWelcome() {
         admittedFlag = true
+        admissionTimeoutTask?.cancel()
+        admissionTimeoutTask = nil
         if let cont = admitContinuation {
             admitContinuation = nil
             cont.resume(returning: true)
@@ -653,7 +698,10 @@ public actor MeshSocket {
     /// The socket closed (or the wait timed out) before a `welcome` arrived — the
     /// server never admitted this connection (e.g. identify rejected). Unblocks the
     /// admission wait with a negative result; no-op once admission is decided.
-    private func failAdmission() {
+    private func failAdmission(generation: UInt64) {
+        guard generation == admissionGeneration else { return }
+        admissionTimeoutTask?.cancel()
+        admissionTimeoutTask = nil
         if let cont = admitContinuation {
             admitContinuation = nil
             cont.resume(returning: false)
@@ -662,17 +710,24 @@ public actor MeshSocket {
 
     /// Suspend until the server admits this connection (`welcome`) or it is closed
     /// / times out first. Returns true only on a real admission.
-    private func awaitAdmission(timeout: TimeInterval = 5.0) async -> Bool {
+    private func awaitAdmission(generation: UInt64) async -> Bool {
+        guard generation == admissionGeneration else { return false }
         if admittedFlag { return true }
+        let timeout = admissionTimeout
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             if admittedFlag {
                 cont.resume(returning: true)
                 return
             }
             admitContinuation = cont
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: MeshSocket.nanoseconds(timeout))
-                await self?.failAdmission()
+            admissionTimeoutTask?.cancel()
+            admissionTimeoutTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: MeshSocket.nanoseconds(timeout))
+                } catch {
+                    return   // cancelled: admission decided or a new attempt began
+                }
+                await self?.failAdmission(generation: generation)
             }
         }
     }
