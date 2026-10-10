@@ -1,5 +1,6 @@
-# carter-b1wp checkpoint (episode 2, beefypc-w2)
-- Branch has 3 commits on main e55c7c0: 8d8d659 (M1/M2), 6d7c427 (handler chains retired per attempt, stale replies dropped), 03ddb52 (tests).
-- Critic blockers (1),(2),(3-partial) addressed in code. Remaining: run swift test (needs mac-lane swift-test, aif-2f72 OPEN, decomposed into aif-w4fl/6zat/j2fe/7zmx, none done).
-- Also unproven: new tests fail on main.
-- Next: find any Swift toolchain path; otherwise bd note + OUTCOME blocked on aif-2f72.
+# carter-b1wp checkpoint (episode 3, beefypc-w3)
+- Branch has 3 code commits on main e55c7c0: 8d8d659 (M1/M2), 6d7c427 (handler chains retired per attempt, stale replies dropped), 03ddb52 (tests).
+- UNTESTED: no Swift toolchain on any Linux lane (no swift, no docker/podman on beefypc; /cache 95% full). Package also uses URLSession without FoundationNetworking, so it is Mac-only anyway.
+- mac-lane has no swift-test action yet (aif-2f72 OPEN; carter-b1wp already depends on it). Do not re-claim this bead on a Linux lane until aif-2f72 lands.
+- Static review (episode 3) of the source diff, all four points OK: M1 timeout Task stored per attempt, cancelled in noteWelcome/retireAttempt(resetAdmission)/failAdmission, failAdmission + awaitAdmission guard on attemptGeneration (actor-isolated); M2 listenLoop calls dispatch() synchronously on the actor, no Task{processPacket} left, per-type FIFO via chained handlerTails; stale replies dropped in sendReply by generation compared on the actor; tools-version 5.9 (no strict concurrency), captures unchanged vs 0.3.0.
+- Verify-only next step on the mac lane: `mac-lane submit --repo MeshSocket --action swift-test --wait` on this branch (expect 31+ executed, 0 failures, 11 integration skipped), then run AdmissionAndOrderTests on main + setAdmissionTimeoutForTesting to prove they fail there.
