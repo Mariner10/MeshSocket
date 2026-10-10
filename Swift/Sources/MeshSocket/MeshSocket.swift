@@ -64,10 +64,12 @@ public actor MeshSocket {
     // we start awaiting it (the receive loop runs concurrently), so it can't be lost.
     private var admitContinuation: CheckedContinuation<Bool, Never>?
     private var admittedFlag = false
-    // Each connection attempt gets its own generation. The admission timeout and
-    // the listen task's close hook carry the generation they were armed for, so a
-    // stale one from an earlier attempt can never fail a later attempt's wait.
-    private var admissionGeneration: UInt64 = 0
+    // Each connection attempt gets its own generation, bumped when the attempt
+    // starts (`resetAdmission`) and when it ends (`retireAttempt`). The admission
+    // timer, the listen task's close hook and every handler run carry the
+    // generation they were armed for, so a stale one from an earlier attempt can
+    // never fail a later attempt's wait or reply on a later connection.
+    private var attemptGeneration: UInt64 = 0
     private var admissionTimeoutTask: Task<Void, Never>?
     /// How long an attempt waits for `welcome` before giving up.
     var admissionTimeout: TimeInterval = 5.0
@@ -75,7 +77,8 @@ public actor MeshSocket {
     // Inbound frames for a handler run strictly in arrival order per message
     // type: each run waits for the previous one of the same type. Different types
     // still run concurrently, so a handler parked on user input (an approval
-    // sheet) never stalls unrelated traffic.
+    // sheet) never stalls unrelated traffic. The chains belong to one connection
+    // attempt: `retireAttempt` starts fresh ones.
     private var handlerTails: [String: Task<Void, Never>] = [:]
 
     private var connectionTask: Task<Void, Never>?
@@ -240,6 +243,7 @@ public actor MeshSocket {
         connectionTask?.cancel()
         connectionTask = nil
         setDisconnected()
+        retireAttempt()
     }
 
     public func waitUntilReady() async {
@@ -249,6 +253,15 @@ public actor MeshSocket {
         }
     }
 
+    /// Handle inbound frames of `type`; a non-nil return is sent back as the reply.
+    ///
+    /// Frames of one type run one at a time, in arrival order: the next waits
+    /// until this handler returns. Different types run concurrently. A handler
+    /// that waits on a person (an approval sheet) should return at once and
+    /// deliver the decision later, as CAR-TER's `provision-device` does (it
+    /// replies `pending` and the requester polls), or every later frame of that
+    /// type waits behind it. A reply returned after the connection dropped is
+    /// discarded, not sent on the next connection.
     public func on(_ type: String, handler: @escaping @Sendable (Any?) async -> Any?) {
         handlers[type] = handler
     }
@@ -369,7 +382,7 @@ public actor MeshSocket {
 
                 transport = ws
                 resetAdmission()
-                let generation = admissionGeneration
+                let generation = attemptGeneration
 
                 // Send identify directly: the socket is open but not yet admitted,
                 // so `_isConnected` is still false and the buffered `send()` path
@@ -426,6 +439,7 @@ public actor MeshSocket {
             setDisconnected()
             transport = nil
             failAllPendingRequests()
+            retireAttempt()
 
             // Pair the down-edge with the up-edge: only report a disconnect for a
             // connection that was actually admitted, so a rejected attempt no longer
@@ -574,16 +588,25 @@ public actor MeshSocket {
 
         guard let msgType, let handler = handlers[msgType] else { return nil }
 
+        let generation = attemptGeneration
         let previous = handlerTails[msgType]
         let run = Task { [weak self] in
             await previous?.value
             let response = await handler(payload)
-            if let self, let response, let msgID {
-                _ = try? await self.send(msgType, payload: response, replyTo: msgID)
-            }
+            guard let self, let response, let msgID else { return }
+            await self.sendReply(msgType, payload: response, replyTo: msgID, generation: generation)
         }
         handlerTails[msgType] = run
         return run
+    }
+
+    /// A handler's reply leaves only on the connection its request arrived on.
+    /// Once that attempt has ended the reply is dropped, never buffered offline
+    /// and flushed to a later connection where its `reply_to` means nothing.
+    private func sendReply(_ type: String, payload: Any, replyTo: String, generation: UInt64) async {
+        guard generation == attemptGeneration, let ws = transport else { return }
+        let packet = buildPacket(id: UUID().uuidString, type: type, payload: payload, replyTo: replyTo)
+        try? await ws.send(packet)
     }
 
     // MARK: - Keepalive
@@ -674,14 +697,26 @@ public actor MeshSocket {
     /// sent so a `welcome` delivered by the concurrently-running receive loop is
     /// latched rather than dropped.
     private func resetAdmission() {
-        admissionGeneration &+= 1
+        retireAttempt()
+    }
+
+    /// End the current attempt. Its admission timer, close hook and handler
+    /// replies go stale, a pending admission wait resolves negatively, and
+    /// handler chains start fresh, so a handler still parked on the old
+    /// connection never holds back frames that arrive on the next one. Old runs
+    /// are not cancelled: frames already received still reach their handler in
+    /// order (as in 0.3.0, nothing received is dropped); only their replies are
+    /// dropped (see `sendReply`).
+    private func retireAttempt() {
+        attemptGeneration &+= 1
         admissionTimeoutTask?.cancel()
         admissionTimeoutTask = nil
         admittedFlag = false
-        if let stale = admitContinuation {
+        if let pending = admitContinuation {
             admitContinuation = nil
-            stale.resume(returning: false)
+            pending.resume(returning: false)
         }
+        handlerTails.removeAll()
     }
 
     /// The server admitted us (`welcome` received).
@@ -699,7 +734,7 @@ public actor MeshSocket {
     /// server never admitted this connection (e.g. identify rejected). Unblocks the
     /// admission wait with a negative result; no-op once admission is decided.
     private func failAdmission(generation: UInt64) {
-        guard generation == admissionGeneration else { return }
+        guard generation == attemptGeneration else { return }
         admissionTimeoutTask?.cancel()
         admissionTimeoutTask = nil
         if let cont = admitContinuation {
@@ -711,7 +746,7 @@ public actor MeshSocket {
     /// Suspend until the server admits this connection (`welcome`) or it is closed
     /// / times out first. Returns true only on a real admission.
     private func awaitAdmission(generation: UInt64) async -> Bool {
-        guard generation == admissionGeneration else { return false }
+        guard generation == attemptGeneration else { return false }
         if admittedFlag { return true }
         let timeout = admissionTimeout
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
