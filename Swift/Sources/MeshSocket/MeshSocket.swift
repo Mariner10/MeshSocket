@@ -395,7 +395,7 @@ public actor MeshSocket {
                 // a close that rejects the identify (e.g. a name conflict) — is
                 // observed. A close before admission resolves the wait negatively.
                 let started = Task { [weak self] in
-                    await self?.listenLoop(ws: ws)
+                    await self?.listenLoop(ws: ws, generation: generation)
                     await self?.failAdmission(generation: generation)
                 }
                 loop = started
@@ -459,10 +459,13 @@ public actor MeshSocket {
         }
     }
 
-    private func listenLoop(ws: any MeshTransport) async {
+    private func listenLoop(ws: any MeshTransport, generation: UInt64) async {
         while isRunning {
             do {
                 let message = try await ws.receive()
+                // A loop outliving its attempt (retired by stop/reconnect) must not
+                // route frames under the new attempt's generation.
+                guard generation == attemptGeneration else { return }
 
                 if rateLimit > 0 {
                     let now = Date()

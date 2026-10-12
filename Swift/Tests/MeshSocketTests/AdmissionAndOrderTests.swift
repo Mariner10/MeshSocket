@@ -14,10 +14,13 @@ final class ScriptedTransport: MeshTransport, @unchecked Sendable {
     private var sentFrames: [String] = []
     private let welcomeDelay: TimeInterval?
     private let lingerOnCancel: TimeInterval
+    private let lingerDeliversWelcome: Bool
 
-    init(welcomeDelay: TimeInterval?, lingerOnCancel: TimeInterval = 0) {
+    init(welcomeDelay: TimeInterval?, lingerOnCancel: TimeInterval = 0,
+         lingerDeliversWelcome: Bool = false) {
         self.welcomeDelay = welcomeDelay
         self.lingerOnCancel = lingerOnCancel
+        self.lingerDeliversWelcome = lingerDeliversWelcome
     }
 
     func resume() {}
@@ -92,12 +95,20 @@ final class ScriptedTransport: MeshTransport, @unchecked Sendable {
         lock.unlock()
         guard let w else { return }
         let linger = lingerOnCancel
+        let welcome = lingerDeliversWelcome
         if linger <= 0 {
             w.resume(throwing: URLError(.networkConnectionLost))
         } else {
             Task {
                 try? await Task.sleep(nanoseconds: MeshSocket.nanoseconds(linger))
-                w.resume(throwing: URLError(.networkConnectionLost))
+                if welcome {
+                    // A frame that straggles in after the cancel.
+                    let d = try! JSONSerialization.data(withJSONObject:
+                        ["id": "w", "type": "welcome", "payload": ["id": "old"], "reply_to": NSNull()] as [String: Any])
+                    w.resume(returning: .string(String(data: d, encoding: .utf8)!))
+                } else {
+                    w.resume(throwing: URLError(.networkConnectionLost))
+                }
             }
         }
     }
@@ -153,6 +164,7 @@ func waitFor(_ seconds: TimeInterval, _ condition: () -> Bool) async -> Bool {
 struct AttemptScript: Sendable {
     var welcomeDelay: TimeInterval?
     var lingerOnCancel: TimeInterval = 0
+    var lingerDeliversWelcome = false
 }
 
 final class AdmissionAndOrderTests: XCTestCase {
@@ -161,7 +173,8 @@ final class AdmissionAndOrderTests: XCTestCase {
         let counter = AttemptCounter()
         let factory: MeshTransportFactory = { _, _ in
             let s = script(counter.next())
-            let t = ScriptedTransport(welcomeDelay: s.welcomeDelay, lingerOnCancel: s.lingerOnCancel)
+            let t = ScriptedTransport(welcomeDelay: s.welcomeDelay, lingerOnCancel: s.lingerOnCancel,
+                                  lingerDeliversWelcome: s.lingerDeliversWelcome)
             rec.add(t)
             return t
         }
@@ -213,6 +226,24 @@ final class AdmissionAndOrderTests: XCTestCase {
         _ = await waitFor(10) { rec.connects >= 1 }
         XCTAssertEqual(rec.connects, 1, "attempt 2 must be admitted despite attempt 1's late close")
         XCTAssertEqual(rec.transports.count, 2, "admitted on the second attempt, no third")
+        await socket.stop()
+    }
+
+    /// A lingering old listen loop must not route frames under the next attempt.
+    /// Attempt 1 is never welcomed, times out at 3 s, and its pending receive
+    /// delivers a stray `welcome` 3 s after the cancel (~6 s). Attempt 2 starts
+    /// ~5 s and is never welcomed (times out ~8 s). The old welcome must not
+    /// admit attempt 2, so nothing is admitted by 7 s.
+    func testStaleLoopFrameDoesNotAdmitNextAttempt() async throws {
+        let rec = Recorder()
+        let socket = makeSocket(rec) { n in
+            n == 1 ? AttemptScript(welcomeDelay: nil, lingerOnCancel: 3.0, lingerDeliversWelcome: true)
+                   : AttemptScript(welcomeDelay: nil)
+        }
+        await socket.setAdmissionTimeoutForTesting(3.0)
+        await socket.start()
+        _ = await waitFor(7) { rec.connects >= 1 }
+        XCTAssertEqual(rec.connects, 0, "a stale welcome from attempt 1 must not admit attempt 2")
         await socket.stop()
     }
 
