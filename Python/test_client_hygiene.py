@@ -87,7 +87,7 @@ def test_sanitize_identity_rejects_non_strings_and_bad_lengths(raw):
 def test_sanitize_identity_is_exported_from_the_package():
     assert meshsocket.sanitize_identity is sanitize_identity
     assert meshsocket.valid_ident is valid_ident
-    assert meshsocket.__version__ == "0.3.0"
+    assert meshsocket.__version__ == "0.4.0"
 
 
 @pytest.mark.asyncio

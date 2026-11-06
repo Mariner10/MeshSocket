@@ -3,6 +3,29 @@
 All notable changes to MeshSocket (the Python `meshsocket` package, the Python
 relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 
+## 0.4.0 (2026-11-06)
+
+### Security
+
+- **The relay stamps the sender on routed payloads.** `route_msg` and
+  `route_msg_noreply` now deliver a dict payload with `_from` set to the name the
+  sender identified as (behind the carter-relay gateway, its namespaced
+  `<account>.<principal>_<name>`), overwriting any `_from` the sender wrote. On an
+  E2EE envelope (`{"e2ee", "s", "n", "ct"}`) the stamp is a key on the outer object
+  beside the ciphertext; the sealed body is untouched. A peer can no longer claim
+  another's name on a routed frame (CAR-TER reads the outer stamp in
+  `HubSurfaceGate` for hub surfaces). `socket_server.stamp_sender` and `SENDER_KEY`
+  are the helper and key.
+- Non-dict payloads pass unchanged. Broadcasts are not stamped: peers match acks
+  against the `_from` they wrote themselves (CAR-TER `command_ack`), and behind the
+  gateway the relay's name for a peer is namespaced, so a broadcast stamp would
+  break those acks.
+
+### Compatibility
+
+Additive key on routed payloads; clients that ignore unknown keys are unaffected.
+Minor bump because the delivered payload changes.
+
 ## 0.3.0 (2026-09-27)
 
 ### Security

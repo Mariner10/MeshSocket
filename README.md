@@ -71,7 +71,9 @@ Add via Swift Package Manager:
 
 - **Request/response** — `request()` sends a message and awaits a reply with configurable timeout
 - **Broadcasting** — send to all nodes (scoped by channel or global)
-- **Direct routing** — send to a specific node by ID and get a response back
+- **Direct routing** — send to a specific node by ID and get a response back. Since 0.4.0 the
+  relay sets `_from` on a routed dict payload to the sender's authenticated name (outside the
+  ciphertext of an E2EE envelope), replacing whatever the sender wrote there
 - **Channel isolation** — nodes on different channels don't see each other's broadcasts
 - **Auth** — token-based authentication on connect
 - **Offline buffering** — RAM buffer with optional disk spill, auto-flush on reconnect

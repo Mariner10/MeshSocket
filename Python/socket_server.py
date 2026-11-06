@@ -19,6 +19,26 @@ class MeshServerConfigError(RuntimeError):
     """The server refused to start because its configuration is unsafe."""
 
 
+# The key the relay writes on every routed payload (0.4.0): the sender's
+# authenticated name, as this relay registered it at identify (through the
+# carter-relay gateway that is the namespaced `<account>.<principal>_<name>`).
+SENDER_KEY = "_from"
+
+
+def stamp_sender(payload: Any, sender_name: str) -> Any:
+    """`payload` with `SENDER_KEY` set to `sender_name`, overwriting any value the
+    sender wrote. Only a dict payload is stamped. On an E2EE envelope
+    (`{"e2ee": 2, "s", "n", "ct"}`) the key lands on the outer, unsealed object
+    beside the ciphertext, which is where receivers read the relay's stamp; the
+    sealed body is never touched. Other payloads (lists, strings, null) pass
+    unchanged. Returns a copy; the caller's dict is not modified."""
+    if not isinstance(payload, dict):
+        return payload
+    stamped = dict(payload)
+    stamped[SENDER_KEY] = sender_name
+    return stamped
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -459,7 +479,8 @@ class MeshServer:
                     return {"error": "malformed route", "status": "failed"}
                 target_id = payload.get('target_id')
                 msg_type = payload.get('type')
-                data = payload.get('payload')
+                # The target learns who sent this from the relay, not the sender.
+                data = stamp_sender(payload.get('payload'), client.name)
                 if not isinstance(target_id, str) or not isinstance(msg_type, str):
                     return {"error": "malformed route", "status": "failed"}
 
@@ -499,7 +520,7 @@ class MeshServer:
                     return {"error": "malformed route", "status": "failed"}
                 target_name = payload.get('target_name')
                 msg_type = payload.get('type')
-                data = payload.get('payload')
+                data = stamp_sender(payload.get('payload'), client.name)
                 if not isinstance(target_name, str) or not isinstance(msg_type, str):
                     return {"error": "malformed route", "status": "failed"}
 
@@ -608,6 +629,12 @@ class MeshServer:
         await self._fan_out(sends, targets, "roster")
 
     async def broadcast(self, type: str, payload: dict, sender: MeshSocket | None = None):
+        # Broadcasts are NOT stamped (only routed payloads are; see stamp_sender).
+        # Peers already put their own `_from` on broadcasts and match replies
+        # against it: CAR-TER writes its bare name on an ack'd command and drops a
+        # `command_ack` whose `to` differs, and carterkit acks to the outer `_from`
+        # of a sealed frame when there is one. Behind the gateway the relay name is
+        # namespaced, so stamping broadcasts would break those acks.
         if not self.clients:
             return
         sends, targets = [], []
