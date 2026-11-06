@@ -22,21 +22,43 @@ class MeshServerConfigError(RuntimeError):
 # The key the relay writes on every routed payload (0.4.0): the sender's
 # authenticated name, as this relay registered it at identify (through the
 # carter-relay gateway that is the namespaced `<account>.<principal>_<name>`).
+# Peers write `_from` too (on broadcasts, where it is left alone), so a receiver
+# cannot tell this stamp from a peer's claim by the key alone: see RELAY_SENDER_KEY.
 SENDER_KEY = "_from"
+
+# The relay-only sender key (0.4.1). Set beside `_from` on every routed payload,
+# and removed from every payload the relay forwards (routed, routed replies and
+# broadcasts), so a receiver that finds it knows this relay wrote it: no peer can
+# get its own copy through. Broadcasts never carry it (they are not stamped).
+RELAY_SENDER_KEY = "_relayFrom"
 
 
 def stamp_sender(payload: Any, sender_name: str) -> Any:
-    """`payload` with `SENDER_KEY` set to `sender_name`, overwriting any value the
-    sender wrote. Only a dict payload is stamped. On an E2EE envelope
-    (`{"e2ee": 2, "s", "n", "ct"}`) the key lands on the outer, unsealed object
-    beside the ciphertext, which is where receivers read the relay's stamp; the
-    sealed body is never touched. Other payloads (lists, strings, null) pass
-    unchanged. Returns a copy; the caller's dict is not modified."""
+    """`payload` with `SENDER_KEY` and `RELAY_SENDER_KEY` set to `sender_name`,
+    overwriting any value the sender wrote. Only a dict payload is stamped. On an
+    E2EE envelope (`{"e2ee": 2, "s", "n", "ct"}`) the keys land on the outer,
+    unsealed object beside the ciphertext, which is where receivers read the
+    relay's stamp; the sealed body is never touched. Other payloads (lists,
+    strings, null) pass unchanged. Returns a copy; the caller's dict is not
+    modified."""
     if not isinstance(payload, dict):
         return payload
     stamped = dict(payload)
     stamped[SENDER_KEY] = sender_name
+    stamped[RELAY_SENDER_KEY] = sender_name
     return stamped
+
+
+def strip_relay_sender(payload: Any) -> Any:
+    """`payload` without a peer-written `RELAY_SENDER_KEY` on its outer object.
+    Only a dict payload changes (a copy; the caller's dict is not modified);
+    nested values and an E2EE envelope's sealed body are not touched, and
+    everything else, `_from` included, is delivered as sent."""
+    if not isinstance(payload, dict) or RELAY_SENDER_KEY not in payload:
+        return payload
+    stripped = dict(payload)
+    del stripped[RELAY_SENDER_KEY]
+    return stripped
 
 
 def _env_int(name: str, default: int) -> int:
@@ -503,7 +525,8 @@ class MeshServer:
                     # The target never answered: say so instead of leaving the
                     # requester to wait out its own timeout with no signal.
                     return {"error": "target timeout", "status": "failed"}
-                return response
+                # The target wrote this reply: it may not carry the relay-only key.
+                return strip_relay_sender(response)
 
             @client.on("get_nodes")
             async def on_get_nodes(payload):
@@ -635,8 +658,11 @@ class MeshServer:
         # `command_ack` whose `to` differs, and carterkit acks to the outer `_from`
         # of a sealed frame when there is one. Behind the gateway the relay name is
         # namespaced, so stamping broadcasts would break those acks.
+        # A peer-written RELAY_SENDER_KEY is removed (0.4.1): on a broadcast the
+        # receiver finds none, so it never mistakes a peer's claim for the relay's.
         if not self.clients:
             return
+        payload = strip_relay_sender(payload)
         sends, targets = [], []
         for peer in list(self.clients.values()):
             if sender and not self._can_receive_broadcast(sender, peer):

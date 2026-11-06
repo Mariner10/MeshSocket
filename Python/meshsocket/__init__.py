@@ -7,4 +7,4 @@ so existing code keeps running while it migrates to the package name.
 from socketCore import MeshSocket, LogColors, sanitize_identity, valid_ident, IDENT_RE, NAMESPACED_RE
 
 __all__ = ["MeshSocket", "LogColors", "sanitize_identity", "valid_ident", "IDENT_RE", "NAMESPACED_RE"]
-__version__ = "0.4.0"
+__version__ = "0.4.1"

@@ -3,6 +3,29 @@
 All notable changes to MeshSocket (the Python `meshsocket` package, the Python
 relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 
+## 0.4.1 (2026-11-06)
+
+### Security
+
+- **A relay-only sender key, `_relayFrom`.** 0.4.0 stamped `_from` on routed
+  payloads but left broadcasts as sent, and a broadcast arrives shaped like a
+  routed frame, so a receiver could not tell the relay's `_from` from one a peer
+  wrote: a hub could still pass as another on a (sealed) broadcast. The relay now
+  also sets `_relayFrom` to the sender's authenticated name on `route_msg` and
+  `route_msg_noreply` payloads (outer object, beside `ct` on an E2EE envelope), and
+  removes any peer-written `_relayFrom` from the outer object of every payload it
+  forwards: routed requests (re-stamped), routed replies, and every broadcast verb.
+  A receiver that finds `_relayFrom` knows this relay wrote it; on a broadcast it
+  finds none. CAR-TER's `HubSurfaceGate` trusts only this key.
+  `socket_server.RELAY_SENDER_KEY` and `strip_relay_sender` are the key and helper.
+- `_from` is unchanged from 0.4.0: stamped on routed payloads, delivered as sent on
+  broadcasts, so ack'd commands keep matching.
+
+### Compatibility
+
+Additive key on routed payloads; clients that ignore unknown keys are unaffected.
+A peer that wrote `_relayFrom` itself loses it in transit.
+
 ## 0.4.0 (2026-11-06)
 
 ### Security
