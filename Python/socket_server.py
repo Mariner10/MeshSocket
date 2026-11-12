@@ -500,13 +500,18 @@ class MeshServer:
                 if not isinstance(payload, dict):
                     return {"error": "malformed route", "status": "failed"}
                 target_id = payload.get('target_id')
+                target_name = payload.get('target_name')
                 msg_type = payload.get('type')
                 # The target learns who sent this from the relay, not the sender.
                 data = stamp_sender(payload.get('payload'), client.name)
-                if not isinstance(target_id, str) or not isinstance(msg_type, str):
+                # Address by id, or by name like route_msg_noreply (the app's hub-audio
+                # requests name the hub: CAR-TER aif-6e55l, spec "Wire contract").
+                by_id = isinstance(target_id, str)
+                address = target_id if by_id else target_name
+                if not isinstance(msg_type, str) or not isinstance(address, str):
                     return {"error": "malformed route", "status": "failed"}
 
-                target = self.clients.get(target_id)
+                target = self.clients.get(address) if by_id else self.clients_by_name.get(address)
                 if not target:
                     return {"error": "Target not found", "status": "failed"}
                 if not client.can_route:

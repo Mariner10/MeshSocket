@@ -285,3 +285,31 @@ def test_stamp_sender_copies_and_ignores_non_dicts():
     assert original == {"a": 1, "_from": "other-hub"}       # caller's dict untouched
     for value in (None, "s", 3, [1, 2]):
         assert stamp_sender(value, "hub-a") is value
+
+
+@pytest.mark.asyncio
+async def test_route_msg_by_target_name_gets_the_reply(relay):
+    """route_msg may name its target like route_msg_noreply (CAR-TER hub audio asks the
+    hub by name: `{target_name, type: audio_command, payload: {verb: hello}}`)."""
+    phone, _ = await relay.join("phone")
+    hub, _ = await relay.join("music-hub")
+    await phone.send(_frame("route_msg", {
+        "target_name": "music-hub", "type": "audio_command", "payload": {"verb": "hello"},
+    }, msg_id="r-name"))
+
+    request = await recv_type(hub, "audio_command")
+    assert request["payload"]["verb"] == "hello"
+    assert request["payload"]["_relayFrom"] == "phone"
+    await hub.send(_frame("audio_command", {"msg_type": "audio_state", "rev": 1}, reply_to=request["id"]))
+    reply = await recv_type(phone, "route_msg")
+    assert reply["reply_to"] == "r-name"
+    assert reply["payload"]["msg_type"] == "audio_state"
+
+
+@pytest.mark.asyncio
+async def test_route_msg_unknown_target_name_is_not_found(relay):
+    phone, _ = await relay.join("phone")
+    await phone.send(_frame("route_msg", {
+        "target_name": "nobody", "type": "audio_command", "payload": {}}, msg_id="r-none"))
+    reply = await recv_type(phone, "route_msg")
+    assert reply["payload"] == {"error": "Target not found", "status": "failed"}
