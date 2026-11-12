@@ -3,7 +3,9 @@
 All notable changes to MeshSocket (the Python `meshsocket` package, the Python
 relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 
-## 0.4.2 (2026-11-12)
+## 0.4.3 (2026-11-12)
+
+(0.4.2 was tagged but never published: its CI run failed on the version test.)
 
 ### Fixed
 
