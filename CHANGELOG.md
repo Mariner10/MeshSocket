@@ -3,6 +3,17 @@
 All notable changes to MeshSocket (the Python `meshsocket` package, the Python
 relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 
+## 0.4.2 (2026-11-12)
+
+### Fixed
+
+- **`route_msg` addresses its target by name.** The request-with-reply route took
+  only `target_id`, so the Python relay answered `malformed route` to a request
+  that names its target (`{"target_name": "music-hub", "type": "audio_command", …}`),
+  which is how CAR-TER's hub-audio player asks a hub for its state and audio bytes.
+  It now accepts `target_name` like `route_msg_noreply`; `target_id` still wins
+  when both are given.
+
 ## 0.4.1 (2026-11-06)
 
 ### Security
