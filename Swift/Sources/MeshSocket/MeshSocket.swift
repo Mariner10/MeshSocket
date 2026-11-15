@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking  // URLSession and its WebSocket task live here on Linux
+#endif
 
 public enum MeshSocketError: Error, Sendable {
     case notConnected

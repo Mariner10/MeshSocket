@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking  // URLSession and its WebSocket task live here on Linux
+#endif
 
 /// The minimal WebSocket surface `MeshSocket` drives. `URLSessionWebSocketTask`
 /// is the production implementation; tests inject a fake (see `KeepaliveTests`)

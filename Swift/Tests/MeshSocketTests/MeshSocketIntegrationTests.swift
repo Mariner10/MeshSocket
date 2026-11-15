@@ -19,13 +19,19 @@ final class MeshSocketIntegrationTests: XCTestCase {
     }
 
     private static func isReachable(host: String, port: Int) -> Bool {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        #if canImport(Glibc)
+        let stream = Int32(SOCK_STREAM.rawValue)   // an enum on Glibc
+        #else
+        let stream = SOCK_STREAM
+        #endif
+        let fd = socket(AF_INET, stream, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
         var tv = timeval(tv_sec: 1, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        var hints = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_STREAM, ai_protocol: 0,
-                             ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var hints = addrinfo()   // field order differs between Darwin and Glibc
+        hints.ai_family = AF_INET
+        hints.ai_socktype = stream
         var info: UnsafeMutablePointer<addrinfo>?
         guard getaddrinfo(host, String(port), &hints, &info) == 0, let addr = info else { return false }
         defer { freeaddrinfo(info) }
