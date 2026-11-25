@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// The minimal WebSocket surface `MeshSocket` drives. `URLSessionWebSocketTask`
 /// is the production implementation; tests inject a fake (see `KeepaliveTests`)
@@ -20,13 +23,18 @@ extension URLSessionWebSocketTask: MeshTransport {
         try await send(.string(text))
     }
 
+    #if !canImport(FoundationNetworking)
+    /// The pong handler can fire more than once (the pong, then an error when the
+    /// socket closes or is cancelled), so resume through `pingOnce`: the first
+    /// call wins, and cancelling the caller (the keepalive's pong timeout, or
+    /// `stop()`) returns at once instead of waiting on a dead socket.
     public func sendPing() async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            sendPing { error in
-                if let error { cont.resume(throwing: error) } else { cont.resume() }
-            }
-        }
+        try await pingOnce { done in sendPing(pongReceiveHandler: done) }
     }
+    #endif
+    // On Linux, swift-corelibs-foundation's URLSessionWebSocketTask already has
+    // `sendPing() async throws`, which satisfies the requirement. Apple platforms
+    // are the shipping target; Linux builds only for tests.
 }
 
 public enum MeshTransports {

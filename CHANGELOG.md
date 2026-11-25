@@ -3,6 +3,37 @@
 All notable changes to MeshSocket (the Python `meshsocket` package, the Python
 relay `socket_server.py`, and the Swift `MeshSocket` package) are recorded here.
 
+## 0.4.4 (2026-11-25)
+
+Swift-only fix release; the Python package and relay are unchanged apart from the
+version number. The Swift sources are otherwise the same as 0.3.0, so an app on
+0.3.0 can move straight to 0.4.4.
+
+### Fixed (Swift)
+
+- **`sendPing()` no longer crashes when the pong handler fires twice.**
+  `URLSessionWebSocketTask.sendPing(pongReceiveHandler:)` can call its handler
+  more than once (the pong, then again with an error when the socket closes or is
+  cancelled), and the wrapper resumed its `CheckedContinuation` on every call, so
+  the second call trapped (`CheckedContinuation.resume(throwing:)`, SIGTRAP). This
+  was CAR-TER Beta 2.0.1's crash, on the keepalive's ping when the socket dropped.
+  The wrapper now goes through an internal one-shot (`pingOnce` / `ResumeOnce`):
+  the first call wins, later calls are ignored, from any thread.
+- **The pong timeout now works against a real socket.** The keepalive races the
+  ping against `pongTimeout` in a task group, and a task group waits for every
+  child; the ping ignored cancellation, so on a dead socket the probe waited for
+  URLSession instead of timing out. A cancelled ping now returns at once with
+  `CancellationError` (a pong that arrives later is ignored), so a missed pong
+  tears the socket down after `pongTimeout` as documented.
+- **`stop()` during the connect probe closes that attempt** instead of leaving the
+  connection task waiting on a socket that never answers.
+
+### Changed (Swift)
+
+- The package builds on Linux (`FoundationNetworking` import), so `swift test`
+  runs there. On Linux the transport uses swift-corelibs-foundation's own
+  `sendPing()`; Apple platforms are the shipping target.
+
 ## 0.4.3 (2026-11-12)
 
 (0.4.2 was tagged but never published: its CI run failed on the version test.)

@@ -1,4 +1,7 @@
 import XCTest
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import MeshSocket
 
 /// A scripted in-memory transport. It welcomes any identify, answers the first

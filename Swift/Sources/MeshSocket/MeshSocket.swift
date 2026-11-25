@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 public enum MeshSocketError: Error, Sendable {
     case notConnected
@@ -346,9 +349,11 @@ public actor MeshSocket {
 
         while isRunning {
             var loop: Task<Void, Never>?
+            var attempt: (any MeshTransport)?
             var didSignalUp = false
             do {
                 let ws = transportFactory(url, session)
+                attempt = ws
                 ws.resume()
 
                 // Connectivity probe: the first pong proves the socket is open.
@@ -402,7 +407,10 @@ public actor MeshSocket {
                 await started.value
 
             } catch is CancellationError {
+                // stop() during the connect probe: `transport` is not set yet, so
+                // stop() could not close this attempt; close it here.
                 loop?.cancel()
+                attempt?.cancel(with: .goingAway, reason: nil)
                 break
             } catch {
                 loop?.cancel()
